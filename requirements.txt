@@ -1,0 +1,6 @@
+# Runtime dependencies for the Vercel Python function.
+# Dev/test extras live in backend/requirements.txt.
+fastapi>=0.118
+openai>=1.59
+python-dotenv>=1.0
+pydantic>=2.12

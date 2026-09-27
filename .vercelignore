@@ -1,0 +1,8 @@
+backend/tests
+backend/demo_cli.py
+backend/pytest.ini
+backend/purchasing.db
+**/__pycache__
+**/*.pyc
+.pytest_cache
+node_modules
