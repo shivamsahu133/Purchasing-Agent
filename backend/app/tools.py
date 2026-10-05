@@ -5,6 +5,7 @@ It never supplies a number that matters. Prices, totals and rankings are
 recomputed server-side from the catalog, so a hallucinated figure cannot reach
 a purchase order.
 """
+import asyncio
 import uuid
 from datetime import date, datetime, timedelta
 
@@ -277,9 +278,102 @@ async def escalate_to_buyer(summary: str, options: list) -> dict:
             "message": "Surfaced to the buyer for a decision."}
 
 
+async def investigate_replenishment_need(sku: str, qty: int, need_by: str) -> dict:
+    """Full INVESTIGATE stage: inventory assessment, contract check, and
+    supplier quote collection in one deterministic call.
+
+    Runs all three lookups in parallel against seeded/mock data and captures
+    missing or low-confidence findings in structured lists so the DECIDE stage
+    and any escalation paths have complete context.
+    """
+    missing_data: list[dict] = []
+    low_confidence: list[dict] = []
+
+    inv_result, contract_result, raw_quotes = await asyncio.gather(
+        check_inventory(sku),
+        get_contract_terms(sku),
+        suppliers.fetch_all_quotes(sku, qty),
+    )
+
+    # Inventory assessment
+    if "error" in inv_result:
+        missing_data.append({
+            "field": "inventory",
+            "severity": "critical",
+            "detail": inv_result["error"],
+        })
+        inventory = None
+    else:
+        inventory = inv_result
+
+    # Contract check
+    if not contract_result.get("under_contract"):
+        missing_data.append({
+            "field": "contracts",
+            "severity": "medium",
+            "detail": "No active contract for {}. Open-market sourcing required.".format(sku),
+        })
+    contracts = contract_result
+
+    # Supplier quotes - surface gaps and reliability concerns
+    if not raw_quotes:
+        missing_data.append({
+            "field": "supplier_quotes",
+            "severity": "critical",
+            "detail": "No approved supplier carries {} at quantity {:,}.".format(sku, qty),
+        })
+    else:
+        if len(raw_quotes) == 1:
+            low_confidence.append({
+                "field": "supplier_quotes",
+                "detail": "Only one supplier quote received — competitive comparison not possible.",
+            })
+        for q in raw_quotes:
+            if q["fillable_qty"] < qty:
+                low_confidence.append({
+                    "field": "supplier_availability",
+                    "supplier_id": q["supplier_id"],
+                    "detail": "{} can only fill {:,} of {:,} requested units.".format(
+                        q["supplier_name"], q["fillable_qty"], qty),
+                })
+            note = q.get("supplier_note") or ""
+            if any(kw in note.lower() for kw in ("shutdown", "disruption", "maintenance")):
+                low_confidence.append({
+                    "field": "supplier_reliability",
+                    "supplier_id": q["supplier_id"],
+                    "detail": "Disruption note on {}: {}".format(q["supplier_name"], note),
+                })
+
+    return {
+        "sku": sku,
+        "qty_requested": qty,
+        "need_by": need_by,
+        "replenishment_needed": inventory["below_reorder_point"] if inventory else None,
+        "inventory": inventory,
+        "contracts": contracts,
+        "quotes": {"count": len(raw_quotes), "quotes": raw_quotes},
+        "missing_data": missing_data,
+        "low_confidence": low_confidence,
+        "data_complete": len(missing_data) == 0,
+    }
+
+
 # --- schemas + dispatch --------------------------------------------------
 
 TOOL_SCHEMAS = [
+    {"type": "function", "function": {
+        "name": "investigate_replenishment_need",
+        "description": (
+            "INVESTIGATE stage entry point. Checks inventory position, active contracts, "
+            "and collects supplier quotes in one parallel call. Returns structured "
+            "missing_data and low_confidence lists for anything that needs escalation. "
+            "Call this first at the start of every run."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "sku": {"type": "string", "description": "e.g. SKU-4471"},
+            "qty": {"type": "integer", "description": "Quantity to source"},
+            "need_by": {"type": "string", "description": "ISO date YYYY-MM-DD"}},
+            "required": ["sku", "qty", "need_by"]}}},
     {"type": "function", "function": {
         "name": "check_inventory",
         "description": "Current stock, reorder point and open POs for a SKU. Start here.",
@@ -342,6 +436,7 @@ TOOL_SCHEMAS = [
 ]
 
 DISPATCH = {
+    "investigate_replenishment_need": investigate_replenishment_need,
     "check_inventory": check_inventory,
     "get_contract_terms": get_contract_terms,
     "get_supplier_quotes": get_supplier_quotes,
