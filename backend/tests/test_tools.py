@@ -107,6 +107,46 @@ async def test_validation_refuses_to_run_without_a_confirmation():
     assert "error" in r
 
 
+# --- ranking: AC-1 / AC-2 / AC-3 audit ----------------------------------
+
+async def test_rank_suppliers_uses_quote_inputs():
+    r = await tools.rank_suppliers("SKU-4471", 2500, NEED_BY)
+    assert r["feasible_count"] >= 0
+    assert r["recommendation"] is not None
+    for opt in r["ranked_options"]:
+        assert "unit_price" in opt
+        assert "lead_time_days" in opt
+        assert "available_qty" in opt
+        assert "min_order_qty" in opt
+
+
+async def test_rank_suppliers_exposes_policy_applied():
+    r = await tools.rank_suppliers("SKU-4471", 2500, NEED_BY)
+    assert "policy_applied" in r
+    assert "weights" in r["policy_applied"]
+    assert "infeasible_penalty" in r["policy_applied"]
+
+
+async def test_rank_suppliers_persists_to_db():
+    r = await tools.rank_suppliers("SKU-4471", 2500, NEED_BY, run_id="audit-run")
+    conn = db.connect()
+    rows = conn.execute(
+        "SELECT * FROM ranking_results WHERE run_id = 'audit-run'"
+    ).fetchall()
+    conn.close()
+    assert len(rows) == 1
+    assert rows[0]["sku"] == "SKU-4471"
+    assert rows[0]["recommendation"] == r["recommendation"]
+
+
+async def test_rank_suppliers_ranking_is_deterministic():
+    r1 = await tools.rank_suppliers("SKU-4471", 2500, NEED_BY)
+    r2 = await tools.rank_suppliers("SKU-4471", 2500, NEED_BY)
+    assert r1["recommendation"] == r2["recommendation"]
+    assert [o["supplier_id"] for o in r1["ranked_options"]] == \
+           [o["supplier_id"] for o in r2["ranked_options"]]
+
+
 async def test_unknown_tool_is_reported_not_raised():
     assert "error" in await tools.call_tool("nope", {})
 

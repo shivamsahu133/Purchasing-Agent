@@ -7,11 +7,23 @@ unit price is a liability, so it never gets the chance.
 """
 from datetime import date
 
-WEIGHTS = {"price": 0.35, "speed": 0.30, "reliability": 0.20, "contract": 0.15}
+# All tunable purchasing policy parameters live here. Pass a partial dict to
+# score_quotes to override any subset; the rest fall back to these defaults.
+# Weights must sum to 1.0 — caller's responsibility if they override.
+DEFAULT_POLICY: dict = {
+    "weights": {
+        "price": 0.35,       # lowest total cost relative to field
+        "speed": 0.30,       # delivery within the need-by window
+        "reliability": 0.20, # historical on-time rate
+        "contract": 0.15,    # preference for contracted suppliers
+    },
+    "infeasible_penalty": 0.30,  # multiplier applied to infeasible option scores
+}
 
-# Infeasible options are kept in the ranking (so the buyer can see *why* the
-# obvious choice was rejected) but pushed below every feasible one.
-INFEASIBLE_PENALTY = 0.30
+# Backward-compatible aliases — existing code that references WEIGHTS or
+# INFEASIBLE_PENALTY directly continues to work unchanged.
+WEIGHTS = DEFAULT_POLICY["weights"]
+INFEASIBLE_PENALTY = DEFAULT_POLICY["infeasible_penalty"]
 
 
 def _clamp(x: float) -> float:
@@ -19,10 +31,21 @@ def _clamp(x: float) -> float:
 
 
 def score_quotes(quotes: list[dict], qty: int, need_by: str,
-                 budget: float | None = None) -> list[dict]:
-    """Rank quotes best-first, with a per-criterion breakdown for each."""
+                 budget: float | None = None,
+                 policy: dict | None = None) -> list[dict]:
+    """Rank quotes best-first, with a per-criterion breakdown for each.
+
+    Pass a partial `policy` dict to override any DEFAULT_POLICY fields for
+    this ranking call. Only the keys you supply are overridden; the rest stay
+    at their defaults. This is the AC-3 policy hook.
+    """
     if not quotes:
         return []
+
+    # Merge caller policy on top of defaults — any key left out keeps its default.
+    effective = {**DEFAULT_POLICY, **(policy or {})}
+    weights = {**DEFAULT_POLICY["weights"], **effective.get("weights", {})}
+    infeasible_penalty = effective.get("infeasible_penalty", INFEASIBLE_PENALTY)
 
     days_available = (date.fromisoformat(need_by) - date.today()).days
     totals = [q["unit_price"] * qty for q in quotes]
@@ -60,9 +83,9 @@ def score_quotes(quotes: list[dict], qty: int, need_by: str,
             "reliability": round(q["reliability"], 4),
             "contract": 1.0 if q["under_contract"] else 0.0,
         }
-        raw = sum(WEIGHTS[k] * v for k, v in parts.items())
+        raw = sum(weights[k] * v for k, v in parts.items())
         feasible = not blocking
-        final = raw if feasible else raw * INFEASIBLE_PENALTY
+        final = raw if feasible else raw * infeasible_penalty
 
         scored.append({
             **q,
@@ -71,7 +94,7 @@ def score_quotes(quotes: list[dict], qty: int, need_by: str,
             "feasible": feasible,
             "blocking_reasons": blocking,
             "score_breakdown": parts,
-            "weights": WEIGHTS,
+            "weights": weights,
             "score": round(final, 4),
         })
 
