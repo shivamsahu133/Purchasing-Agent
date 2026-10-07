@@ -85,21 +85,31 @@ async def get_supplier_quotes(sku: str, qty: int) -> dict:
 
 
 async def rank_suppliers(sku: str, qty: int, need_by: str,
-                         budget: float = None) -> dict:
-    """Score every live quote against the requirement. Deterministic."""
+                         budget: float = None, run_id: str = "") -> dict:
+    """Score every live quote against the requirement. Deterministic.
+
+    Uses scoring.DEFAULT_POLICY for weights and thresholds. The ranking is
+    computed entirely in code — the model reads the result and explains it,
+    but never controls a number that affects which supplier wins.
+    """
     quotes = await suppliers.fetch_all_quotes(sku, qty)
     ranked = scoring.score_quotes(quotes, qty, need_by, budget)
     feasible = [r for r in ranked if r["feasible"]]
-    return {
+    recommendation = feasible[0]["supplier_id"] if feasible else None
+    result = {
         "sku": sku,
         "qty": qty,
         "need_by": need_by,
+        "policy_applied": scoring.DEFAULT_POLICY,
         "weights_used": scoring.WEIGHTS,
         "ranked_options": ranked,
         "feasible_count": len(feasible),
-        "recommendation": feasible[0]["supplier_id"] if feasible else None,
+        "recommendation": recommendation,
         "rationale": scoring.explain_choice(ranked),
     }
+    db.save_ranking_result(run_id, sku, qty, need_by,
+                           scoring.DEFAULT_POLICY, ranked, recommendation)
+    return result
 
 
 async def create_purchase_order(sku: str, supplier_id: str, qty: int,
@@ -357,7 +367,7 @@ async def call_tool(name: str, args: dict, run_id: str = "") -> dict:
     fn = DISPATCH.get(name)
     if fn is None:
         return {"error": "Unknown tool " + str(name) + "."}
-    if name == "create_purchase_order":
+    if name in ("create_purchase_order", "rank_suppliers"):
         args = dict(args, run_id=run_id)
     try:
         return await fn(**args)
