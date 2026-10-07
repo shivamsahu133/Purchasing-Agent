@@ -111,6 +111,10 @@ def _investigate_replenishment_need(r: dict) -> dict:
     quotes_block = r.get("quotes") or {}
     if quotes_block.get("count", 0) > 0:
         out["quotes"] = [_quote(q) for q in quotes_block["quotes"]]
+    if r.get("unavailable_supplier_ids"):
+        out["unavailable_supplier_ids"] = r["unavailable_supplier_ids"]
+    if r.get("conflicts"):
+        out["conflicts"] = r["conflicts"]
     if r.get("missing_data"):
         out["missing_data"] = r["missing_data"]
     if r.get("low_confidence"):

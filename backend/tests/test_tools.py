@@ -107,6 +107,8 @@ async def test_validation_refuses_to_run_without_a_confirmation():
     assert "error" in r
 
 
+# --- AC-1: quote fields present -----------------------------------------
+
 async def test_investigate_returns_inventory_and_quotes():
     r = await tools.investigate_replenishment_need("SKU-4471", 2500, NEED_BY)
     assert r["sku"] == "SKU-4471"
@@ -115,6 +117,92 @@ async def test_investigate_returns_inventory_and_quotes():
     assert r["inventory"]["below_reorder_point"] is True
     assert r["quotes"]["count"] > 0
 
+
+async def test_investigate_quote_contains_required_fields():
+    r = await tools.investigate_replenishment_need("SKU-4471", 2500, NEED_BY)
+    for q in r["quotes"]["quotes"]:
+        assert "unit_price" in q
+        assert "lead_time_days" in q
+        assert "min_order_qty" in q
+        assert "available_qty" in q
+
+
+# --- AC-2: unavailable quotes recorded ----------------------------------
+
+
+async def test_investigate_unavailable_supplier_recorded_in_missing_data():
+    # SKU-7788 is only in catalog for S-002 and S-004; S-001 and S-003 carry nothing
+    r = await tools.investigate_replenishment_need("SKU-7788", 100, NEED_BY)
+    unavailable = r["unavailable_supplier_ids"]
+    assert "S-001" in unavailable or "S-003" in unavailable
+    missing_supplier_ids = {m.get("supplier_id") for m in r["missing_data"]
+                            if m["field"] == "supplier_quotes"}
+    assert missing_supplier_ids & {"S-001", "S-003"}
+
+
+# --- AC-3: conflicts recorded -------------------------------------------
+
+async def test_investigate_detects_lead_time_conflict_for_contracted_supplier():
+    # S-001/SKU-4471: contract specifies 10 days, catalog shows 18 (shutdown)
+    r = await tools.investigate_replenishment_need("SKU-4471", 2500, NEED_BY)
+    conflicts = r["conflicts"]
+    lt_conflicts = [c for c in conflicts
+                    if c["supplier_id"] == "S-001" and c["field"] == "lead_time_days"]
+    assert lt_conflicts, "Expected a lead-time conflict for S-001 on SKU-4471"
+    assert lt_conflicts[0]["contracted"] == 10
+    assert lt_conflicts[0]["quoted"] == 18
+
+
+async def test_investigate_no_conflict_when_terms_match():
+    # S-002 is not under contract for SKU-4471, so no conflict expected
+    r = await tools.investigate_replenishment_need("SKU-4471", 2500, NEED_BY)
+    s002_conflicts = [c for c in r["conflicts"] if c["supplier_id"] == "S-002"]
+    assert not s002_conflicts
+
+
+# --- AC-4: quotes persisted to SQLite ------------------------------------
+
+async def test_investigate_persists_received_quotes_to_db():
+    await tools.investigate_replenishment_need("SKU-4471", 2500, NEED_BY, run_id="test-run")
+    conn = db.connect()
+    rows = conn.execute(
+        "SELECT * FROM quote_results WHERE run_id = 'test-run' AND sku = 'SKU-4471'"
+    ).fetchall()
+    conn.close()
+    received = [r for r in rows if r["status"] == "received"]
+    assert len(received) > 0
+    for row in received:
+        assert row["unit_price"] is not None
+        assert row["lead_time_days"] is not None
+        assert row["min_order_qty"] is not None
+        assert row["available_qty"] is not None
+
+
+async def test_investigate_persists_unavailable_suppliers_to_db():
+    await tools.investigate_replenishment_need("SKU-7788", 100, NEED_BY, run_id="test-gaps")
+    conn = db.connect()
+    rows = conn.execute(
+        "SELECT * FROM quote_results WHERE run_id = 'test-gaps' AND sku = 'SKU-7788'"
+    ).fetchall()
+    conn.close()
+    unavailable = [r for r in rows if r["status"] == "unavailable"]
+    assert len(unavailable) > 0
+    assert any(r["supplier_id"] in ("S-001", "S-003") for r in unavailable)
+
+
+async def test_investigate_persists_conflict_detail_to_db():
+    await tools.investigate_replenishment_need("SKU-4471", 2500, NEED_BY, run_id="test-conflict")
+    conn = db.connect()
+    row = conn.execute(
+        "SELECT conflict_detail FROM quote_results "
+        "WHERE run_id = 'test-conflict' AND supplier_id = 'S-001'"
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    assert row["conflict_detail"] is not None  # lead-time conflict was stored
+
+
+# --- existing investigate tests -----------------------------------------
 
 async def test_investigate_surfaces_no_contract_as_missing_data():
     # SKU-2210 has no contract in the seed data

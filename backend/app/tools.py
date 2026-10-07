@@ -278,22 +278,27 @@ async def escalate_to_buyer(summary: str, options: list) -> dict:
             "message": "Surfaced to the buyer for a decision."}
 
 
-async def investigate_replenishment_need(sku: str, qty: int, need_by: str) -> dict:
+async def investigate_replenishment_need(sku: str, qty: int, need_by: str,
+                                         run_id: str = "") -> dict:
     """Full INVESTIGATE stage: inventory assessment, contract check, and
     supplier quote collection in one deterministic call.
 
     Runs all three lookups in parallel against seeded/mock data and captures
     missing or low-confidence findings in structured lists so the DECIDE stage
-    and any escalation paths have complete context.
+    and any escalation paths have complete context. Quote results are persisted
+    to SQLite for auditability and serverless resume support.
     """
     missing_data: list[dict] = []
     low_confidence: list[dict] = []
 
-    inv_result, contract_result, raw_quotes = await asyncio.gather(
+    inv_result, contract_result, quote_data = await asyncio.gather(
         check_inventory(sku),
         get_contract_terms(sku),
-        suppliers.fetch_all_quotes(sku, qty),
+        suppliers.fetch_all_quotes_with_gaps(sku, qty),
     )
+
+    raw_quotes: list[dict] = quote_data["quotes"]
+    unavailable_ids: list[str] = quote_data["unavailable_supplier_ids"]
 
     # Inventory assessment
     if "error" in inv_result:
@@ -315,7 +320,21 @@ async def investigate_replenishment_need(sku: str, qty: int, need_by: str) -> di
         })
     contracts = contract_result
 
-    # Supplier quotes - surface gaps and reliability concerns
+    # AC-2: Record suppliers that returned no quote
+    if unavailable_ids:
+        conn = db.connect()
+        names = {r["id"]: r["name"]
+                 for r in conn.execute("SELECT id, name FROM suppliers").fetchall()}
+        conn.close()
+        for sid in unavailable_ids:
+            missing_data.append({
+                "field": "supplier_quotes",
+                "severity": "low",
+                "supplier_id": sid,
+                "detail": "{} does not list {} — no quote available.".format(
+                    names.get(sid, sid), sku),
+            })
+
     if not raw_quotes:
         missing_data.append({
             "field": "supplier_quotes",
@@ -344,6 +363,35 @@ async def investigate_replenishment_need(sku: str, qty: int, need_by: str) -> di
                     "detail": "Disruption note on {}: {}".format(q["supplier_name"], note),
                 })
 
+    # AC-3: Detect conflicts between catalog quotes and contract terms
+    conflicts: list[dict] = []
+    for q in raw_quotes:
+        if not q.get("under_contract"):
+            continue
+        sid = q["supplier_id"]
+        if abs(q["unit_price"] - q["contracted_price"]) > 0.001:
+            conflicts.append({
+                "supplier_id": sid,
+                "field": "unit_price",
+                "contracted": q["contracted_price"],
+                "quoted": q["unit_price"],
+                "detail": "{} quoted ${:.4f}/unit but contracted price is ${:.4f}.".format(
+                    q["supplier_name"], q["unit_price"], q["contracted_price"]),
+            })
+        contracted_lt = q.get("contracted_lead_time_days")
+        if contracted_lt is not None and q["lead_time_days"] != contracted_lt:
+            conflicts.append({
+                "supplier_id": sid,
+                "field": "lead_time_days",
+                "contracted": contracted_lt,
+                "quoted": q["lead_time_days"],
+                "detail": "{} shows {} day lead time but contract specifies {} days.".format(
+                    q["supplier_name"], q["lead_time_days"], contracted_lt),
+            })
+
+    # AC-4: Persist quotes and gaps to SQLite
+    db.save_quote_results(run_id, sku, raw_quotes, unavailable_ids, conflicts)
+
     return {
         "sku": sku,
         "qty_requested": qty,
@@ -352,6 +400,8 @@ async def investigate_replenishment_need(sku: str, qty: int, need_by: str) -> di
         "inventory": inventory,
         "contracts": contracts,
         "quotes": {"count": len(raw_quotes), "quotes": raw_quotes},
+        "unavailable_supplier_ids": unavailable_ids,
+        "conflicts": conflicts,
         "missing_data": missing_data,
         "low_confidence": low_confidence,
         "data_complete": len(missing_data) == 0,
@@ -452,7 +502,7 @@ async def call_tool(name: str, args: dict, run_id: str = "") -> dict:
     fn = DISPATCH.get(name)
     if fn is None:
         return {"error": "Unknown tool " + str(name) + "."}
-    if name == "create_purchase_order":
+    if name in ("create_purchase_order", "investigate_replenishment_need"):
         args = dict(args, run_id=run_id)
     try:
         return await fn(**args)
