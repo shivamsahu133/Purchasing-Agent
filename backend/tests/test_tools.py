@@ -107,6 +107,61 @@ async def test_validation_refuses_to_run_without_a_confirmation():
     assert "error" in r
 
 
+async def test_investigate_returns_inventory_and_quotes():
+    r = await tools.investigate_replenishment_need("SKU-4471", 2500, NEED_BY)
+    assert r["sku"] == "SKU-4471"
+    assert r["qty_requested"] == 2500
+    assert r["replenishment_needed"] is True
+    assert r["inventory"]["below_reorder_point"] is True
+    assert r["quotes"]["count"] > 0
+
+
+async def test_investigate_surfaces_no_contract_as_missing_data():
+    # SKU-2210 has no contract in the seed data
+    r = await tools.investigate_replenishment_need("SKU-2210", 500, NEED_BY)
+    fields = {m["field"] for m in r["missing_data"]}
+    assert "contracts" in fields
+
+
+async def test_investigate_surfaces_contracted_sku_has_no_missing_contract():
+    # SKU-4471 has a contract with S-001
+    r = await tools.investigate_replenishment_need("SKU-4471", 2500, NEED_BY)
+    missing_fields = {m["field"] for m in r["missing_data"]}
+    assert "contracts" not in missing_fields
+
+
+async def test_investigate_surfaces_partial_fill_as_low_confidence():
+    # S-001 only has 600 units of SKU-4471; ordering 2500 should flag it
+    r = await tools.investigate_replenishment_need("SKU-4471", 2500, NEED_BY)
+    low_fields = {lc["field"] for lc in r["low_confidence"]}
+    assert "supplier_availability" in low_fields
+
+
+async def test_investigate_surfaces_supplier_disruption_as_low_confidence():
+    # S-001 has a "shutdown" note in the seed data
+    r = await tools.investigate_replenishment_need("SKU-4471", 2500, NEED_BY)
+    disrupted = [lc for lc in r["low_confidence"]
+                 if lc["field"] == "supplier_reliability"]
+    assert any(lc["supplier_id"] == "S-001" for lc in disrupted)
+
+
+async def test_investigate_unknown_sku_surfaces_as_critical_missing():
+    r = await tools.investigate_replenishment_need("SKU-DOES-NOT-EXIST", 100, NEED_BY)
+    critical = [m for m in r["missing_data"] if m["severity"] == "critical"]
+    assert any(m["field"] == "inventory" for m in critical)
+    assert r["replenishment_needed"] is None
+    assert r["data_complete"] is False
+
+
+async def test_investigate_is_repeatable_on_same_seeded_data():
+    r1 = await tools.investigate_replenishment_need("SKU-4471", 2500, NEED_BY)
+    r2 = await tools.investigate_replenishment_need("SKU-4471", 2500, NEED_BY)
+    assert r1["quotes"]["count"] == r2["quotes"]["count"]
+    assert r1["missing_data"] == r2["missing_data"]
+    assert r1["low_confidence"] == r2["low_confidence"]
+    assert r1["replenishment_needed"] == r2["replenishment_needed"]
+
+
 async def test_unknown_tool_is_reported_not_raised():
     assert "error" in await tools.call_tool("nope", {})
 
