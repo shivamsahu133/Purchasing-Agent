@@ -169,3 +169,101 @@ async def test_unknown_tool_is_reported_not_raised():
 async def test_bad_arguments_are_reported_back_to_the_model():
     r = await tools.call_tool("check_inventory", {"wrong_arg": 1})
     assert "error" in r
+
+
+# --- approval gate persistence (AC-1 / AC-2) -----------------------------
+
+async def test_placed_order_creates_auto_approved_gate():
+    r = await tools.create_purchase_order("SKU-4471", "S-002", 1000, NEED_BY,
+                                          run_id="RUN-GATE-1")
+    assert r["status"] == "placed"
+    assert "gate_id" in r
+    conn = db.connect()
+    gate = conn.execute("SELECT * FROM approval_gates WHERE id = ?",
+                        (r["gate_id"],)).fetchone()
+    conn.close()
+    assert gate is not None
+    assert gate["outcome"] == "auto_approved"
+    assert gate["po_id"] == r["po_id"]
+    assert gate["threshold_used"] == pytest.approx(tools.APPROVAL_THRESHOLD)
+
+
+async def test_large_order_creates_requires_approval_gate():
+    r = await tools.create_purchase_order("SKU-4471", "S-002", 2500, NEED_BY,
+                                          run_id="RUN-GATE-2")
+    assert r["status"] == "pending_approval"
+    conn = db.connect()
+    gate = conn.execute("SELECT * FROM approval_gates WHERE id = ?",
+                        (r["gate_id"],)).fetchone()
+    conn.close()
+    assert gate["outcome"] == "requires_approval"
+    assert gate["order_total"] == pytest.approx(r["total"])
+
+
+async def test_gate_included_in_run_state_export():
+    r = await tools.create_purchase_order("SKU-4471", "S-004", 1000, NEED_BY,
+                                          run_id="RUN-GATE-3")
+    state = db.export_run_state("RUN-GATE-3")
+    assert "gates" in state
+    assert len(state["gates"]) == 1
+    assert state["gates"][0]["id"] == r["gate_id"]
+
+
+async def test_gate_survives_export_import_cycle():
+    r = await tools.create_purchase_order("SKU-4471", "S-004", 1000, NEED_BY,
+                                          run_id="RUN-GATE-4")
+    state = db.export_run_state("RUN-GATE-4")
+
+    db.reset_and_seed()
+    conn = db.connect()
+    count_before = conn.execute(
+        "SELECT COUNT(*) AS n FROM approval_gates").fetchone()["n"]
+    conn.close()
+    assert count_before == 0
+
+    db.import_run_state(state)
+    conn = db.connect()
+    gate = conn.execute("SELECT * FROM approval_gates WHERE id = ?",
+                        (r["gate_id"],)).fetchone()
+    conn.close()
+    assert gate is not None
+    assert gate["outcome"] == "auto_approved"
+
+
+# --- unconfigured threshold path (AC-3) ----------------------------------
+
+async def test_uncertain_outcome_when_threshold_env_var_is_empty(monkeypatch):
+    monkeypatch.setenv("APPROVAL_THRESHOLD_USD", "")
+    r = await tools.create_purchase_order("SKU-4471", "S-004", 1000, NEED_BY,
+                                          run_id="RUN-GATE-5")
+    assert r["status"] == "threshold_unknown"
+    assert r["approval_required"] is True
+    assert "escalate_to_buyer" in r["message"]
+
+
+async def test_uncertain_gate_row_when_threshold_unconfigured(monkeypatch):
+    monkeypatch.setenv("APPROVAL_THRESHOLD_USD", "")
+    r = await tools.create_purchase_order("SKU-4471", "S-004", 1000, NEED_BY,
+                                          run_id="RUN-GATE-6")
+    conn = db.connect()
+    gate = conn.execute("SELECT * FROM approval_gates WHERE id = ?",
+                        (r["gate_id"],)).fetchone()
+    conn.close()
+    assert gate["outcome"] == "uncertain"
+    assert gate["threshold_used"] is None
+
+
+async def test_confirmation_blocked_for_threshold_unknown_order(monkeypatch):
+    monkeypatch.setenv("APPROVAL_THRESHOLD_USD", "")
+    r = await tools.create_purchase_order("SKU-4471", "S-004", 1000, NEED_BY)
+    conf = await tools.get_order_confirmation(r["po_id"])
+    assert "error" in conf
+    assert "unconfigured" in conf["error"]
+
+
+async def test_custom_threshold_via_env_var(monkeypatch):
+    monkeypatch.setenv("APPROVAL_THRESHOLD_USD", "5000")
+    small = await tools.create_purchase_order("SKU-4471", "S-004", 500, NEED_BY)
+    large = await tools.create_purchase_order("SKU-4471", "S-004", 1000, NEED_BY)
+    assert small["status"] == "placed"
+    assert large["status"] == "pending_approval"
