@@ -211,7 +211,12 @@ async def create_purchase_order(sku: str, supplier_id: str, qty: int,
         "po_id": po_id, "sku": sku, "supplier_id": supplier_id,
         "supplier_name": name, "qty": qty, "unit_price": unit_price,
         "total": total, "need_by": need_by, "promised_date": promised,
+<<<<<<< HEAD
+        "lead_time_days": row["lead_time_days"],
+        "status": status,
+=======
         "status": status, "gate_id": gate_id,
+>>>>>>> 5cc810c78aa50a96c0ef8ee34d3d4fd182feb205
     }
     if needs_approval:
         result["approval_required"] = True
