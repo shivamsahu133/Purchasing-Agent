@@ -4,8 +4,9 @@ Seeded deterministically so the demo tells the same story on every run.
 Dates are stored relative to "today" so the scenario never goes stale.
 """
 import sqlite3
+import uuid
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 def _default_db_path() -> Path:
@@ -76,6 +77,18 @@ CREATE TABLE IF NOT EXISTS confirmations (
     promised_date TEXT NOT NULL,
     received_at TEXT NOT NULL
 );
+-- One row per create_purchase_order call: records whether the order was
+-- auto-approved, held for human approval, or blocked because the threshold
+-- policy is unconfigured.
+CREATE TABLE IF NOT EXISTS approval_gates (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    po_id TEXT NOT NULL,
+    order_total REAL NOT NULL,
+    threshold_used REAL,
+    outcome TEXT NOT NULL,
+    decided_at TEXT NOT NULL
+);
 """
 
 # --- seed ----------------------------------------------------------------
@@ -132,7 +145,7 @@ def reset_and_seed() -> None:
     conn = connect()
     conn.executescript(SCHEMA)
     for table in ("inventory", "suppliers", "contracts", "catalog",
-                  "purchase_orders", "confirmations"):
+                  "purchase_orders", "confirmations", "approval_gates"):
         conn.execute(f"DELETE FROM {table}")
     conn.executemany("INSERT INTO inventory VALUES (?,?,?,?,?)", INVENTORY)
     conn.executemany("INSERT INTO suppliers VALUES (?,?,?,?)", SUPPLIERS)
@@ -171,8 +184,10 @@ def export_run_state(run_id: str) -> dict:
         confirmations = [dict(r) for r in conn.execute(
             "SELECT * FROM confirmations WHERE po_id IN (" + marks + ")",
             ids).fetchall()]
+    gates = [dict(r) for r in conn.execute(
+        "SELECT * FROM approval_gates WHERE run_id = ?", (run_id,)).fetchall()]
     conn.close()
-    return {"orders": orders, "confirmations": confirmations}
+    return {"orders": orders, "confirmations": confirmations, "gates": gates}
 
 
 def import_run_state(state: dict | None) -> None:
@@ -191,5 +206,29 @@ def import_run_state(state: dict | None) -> None:
         conn.execute("INSERT OR REPLACE INTO confirmations VALUES (?,?,?,?,?)",
                      (c["po_id"], c["confirmed_unit_price"], c["confirmed_qty"],
                       c["promised_date"], c["received_at"]))
+    for g in state.get("gates") or []:
+        conn.execute("INSERT OR REPLACE INTO approval_gates VALUES (?,?,?,?,?,?,?)",
+                     (g["id"], g["run_id"], g["po_id"], g["order_total"],
+                      g["threshold_used"], g["outcome"], g["decided_at"]))
     conn.commit()
     conn.close()
+
+
+def save_approval_gate(run_id: str, po_id: str, order_total: float,
+                       threshold_used: float | None, outcome: str) -> str:
+    """Persist an approval gate decision and return its id.
+
+    outcome is one of:
+      'auto_approved'      — total below threshold, order placed immediately
+      'requires_approval'  — total at or above threshold, human must approve
+      'uncertain'          — threshold not configured, must escalate
+    """
+    gate_id = "GATE-" + uuid.uuid4().hex[:8].upper()
+    conn = connect()
+    conn.execute(
+        "INSERT INTO approval_gates VALUES (?,?,?,?,?,?,?)",
+        (gate_id, run_id, po_id, order_total, threshold_used, outcome,
+         datetime.now().isoformat(timespec="seconds")))
+    conn.commit()
+    conn.close()
+    return gate_id
