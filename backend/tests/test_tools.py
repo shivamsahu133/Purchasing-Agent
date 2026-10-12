@@ -114,3 +114,72 @@ async def test_unknown_tool_is_reported_not_raised():
 async def test_bad_arguments_are_reported_back_to_the_model():
     r = await tools.call_tool("check_inventory", {"wrong_arg": 1})
     assert "error" in r
+
+
+# --- DECIDE stage: recommendation selection and persistence (AC-1 / AC-2) -
+
+async def test_rank_suppliers_returns_recommendation_and_confidence():
+    r = await tools.rank_suppliers("SKU-4471", 1000, NEED_BY)
+    assert "recommendation" in r
+    assert "confidence" in r
+    assert r["confidence"] in ("high", "low")
+
+
+async def test_rank_suppliers_persists_decision_when_run_id_given():
+    r = await tools.rank_suppliers("SKU-4471", 1000, NEED_BY, run_id="RUN-DEC-1")
+    assert r["decision_id"] is not None
+    assert r["decision_id"].startswith("DEC-")
+    conn = db.connect()
+    row = conn.execute("SELECT * FROM decisions WHERE id = ?",
+                       (r["decision_id"],)).fetchone()
+    conn.close()
+    assert row is not None
+    assert row["run_id"] == "RUN-DEC-1"
+    assert row["sku"] == "SKU-4471"
+    assert row["confidence"] in ("high", "low")
+    assert row["rationale"] != ""
+
+
+async def test_rank_suppliers_no_decision_written_without_run_id():
+    r = await tools.rank_suppliers("SKU-4471", 1000, NEED_BY)
+    assert r["decision_id"] is None
+    conn = db.connect()
+    count = conn.execute("SELECT COUNT(*) AS n FROM decisions").fetchone()["n"]
+    conn.close()
+    assert count == 0
+
+
+async def test_decision_included_in_run_state_export():
+    r = await tools.rank_suppliers("SKU-4471", 1000, NEED_BY, run_id="RUN-DEC-2")
+    state = db.export_run_state("RUN-DEC-2")
+    assert "decisions" in state
+    assert len(state["decisions"]) == 1
+    assert state["decisions"][0]["id"] == r["decision_id"]
+
+
+async def test_decision_survives_export_import_cycle():
+    r = await tools.rank_suppliers("SKU-4471", 1000, NEED_BY, run_id="RUN-DEC-3")
+    state = db.export_run_state("RUN-DEC-3")
+
+    db.reset_and_seed()
+    conn = db.connect()
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM decisions").fetchone()["n"] == 0
+    conn.close()
+
+    db.import_run_state(state)
+    conn = db.connect()
+    row = conn.execute("SELECT * FROM decisions WHERE id = ?",
+                       (r["decision_id"],)).fetchone()
+    conn.close()
+    assert row is not None
+    assert row["sku"] == "SKU-4471"
+    assert row["run_id"] == "RUN-DEC-3"
+
+
+async def test_recommendation_detail_present_when_feasible_option_exists():
+    r = await tools.rank_suppliers("SKU-4471", 1000, NEED_BY)
+    assert r["recommendation_detail"] is not None
+    detail = r["recommendation_detail"]
+    assert detail["supplier_id"] == r["recommendation"]
+    assert detail["unit_price"] > 0
