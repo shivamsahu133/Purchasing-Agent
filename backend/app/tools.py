@@ -147,6 +147,7 @@ async def create_purchase_order(sku: str, supplier_id: str, qty: int,
         "po_id": po_id, "sku": sku, "supplier_id": supplier_id,
         "supplier_name": name, "qty": qty, "unit_price": unit_price,
         "total": total, "need_by": need_by, "promised_date": promised,
+        "lead_time_days": row["lead_time_days"],
         "status": status,
     }
     if needs_approval:

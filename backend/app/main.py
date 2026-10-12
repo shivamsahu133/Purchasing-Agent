@@ -101,8 +101,10 @@ def orders():
     db.ensure_seeded()
     conn = db.connect()
     rows = conn.execute(
-        "SELECT p.*, s.name AS supplier_name FROM purchase_orders p "
+        "SELECT p.*, s.name AS supplier_name, c.lead_time_days "
+        "FROM purchase_orders p "
         "JOIN suppliers s ON s.id = p.supplier_id "
+        "LEFT JOIN catalog c ON c.supplier_id = p.supplier_id AND c.sku = p.sku "
         "ORDER BY p.created_at DESC").fetchall()
     conn.close()
     return {"orders": [dict(r) for r in rows]}
