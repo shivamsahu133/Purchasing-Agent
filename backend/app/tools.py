@@ -5,13 +5,37 @@ It never supplies a number that matters. Prices, totals and rankings are
 recomputed server-side from the catalog, so a hallucinated figure cannot reach
 a purchase order.
 """
+import asyncio
+import os
 import uuid
 from datetime import date, datetime, timedelta
 
 from . import db, scoring, suppliers
 
-# Orders at or above this value need a human before they are placed.
+# Default approval threshold. Can be overridden by APPROVAL_THRESHOLD_USD env
+# var. Setting the env var to an empty string signals the policy is explicitly
+# unconfigured — the run must escalate rather than guess.
 APPROVAL_THRESHOLD = 10_000.0
+
+
+def get_approval_threshold() -> float | None:
+    """Return the configured approval threshold, or None if unconfigured.
+
+    Reads APPROVAL_THRESHOLD_USD from the environment:
+      - absent  → fall back to the APPROVAL_THRESHOLD constant (10 000)
+      - empty / non-numeric → policy intentionally unset; caller must escalate
+      - valid float → use that value
+    """
+    raw = os.getenv("APPROVAL_THRESHOLD_USD")
+    if raw is None:
+        return APPROVAL_THRESHOLD
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 # Deviation between the PO we send and the confirmation we get back, per
 # supplier. This is the seam the validation stage exists to find.
@@ -85,20 +109,31 @@ async def get_supplier_quotes(sku: str, qty: int) -> dict:
 
 
 async def rank_suppliers(sku: str, qty: int, need_by: str,
-                         budget: float = None) -> dict:
-    """Score every live quote against the requirement. Deterministic."""
+                         budget: float = None, run_id: str = "") -> dict:
+    """Score every live quote, select a recommendation, and persist the decision."""
     quotes = await suppliers.fetch_all_quotes(sku, qty)
     ranked = scoring.score_quotes(quotes, qty, need_by, budget)
-    feasible = [r for r in ranked if r["feasible"]]
+    recommendation = scoring.select_recommendation(ranked)
+    rationale = scoring.explain_choice(ranked)
+
+    decision_id = None
+    if run_id:
+        decision_id = db.save_decision(
+            run_id, sku, qty, need_by, ranked, recommendation, rationale)
+
     return {
         "sku": sku,
         "qty": qty,
         "need_by": need_by,
         "weights_used": scoring.WEIGHTS,
         "ranked_options": ranked,
-        "feasible_count": len(feasible),
-        "recommendation": feasible[0]["supplier_id"] if feasible else None,
-        "rationale": scoring.explain_choice(ranked),
+        "feasible_count": sum(1 for r in ranked if r["feasible"]),
+        "recommendation": recommendation["recommended_supplier_id"],
+        "confidence": recommendation["confidence"],
+        "confidence_note": recommendation.get("confidence_note"),
+        "recommendation_detail": recommendation.get("recommended_option"),
+        "rationale": rationale,
+        "decision_id": decision_id,
     }
 
 
@@ -107,6 +142,7 @@ async def create_purchase_order(sku: str, supplier_id: str, qty: int,
     """Raise a PO. Blocks on human approval at or above the threshold.
 
     The unit price is taken from the catalog, never from the caller.
+    The approval gate decision is always persisted to the approval_gates table.
     """
     conn = db.connect()
     row = conn.execute(
@@ -133,7 +169,33 @@ async def create_purchase_order(sku: str, supplier_id: str, qty: int,
     total = round(unit_price * qty, 2)
     promised = (date.today() + timedelta(days=row["lead_time_days"])).isoformat()
     po_id = "PO-" + uuid.uuid4().hex[:6].upper()
-    needs_approval = total >= APPROVAL_THRESHOLD
+
+    threshold = get_approval_threshold()
+
+    if threshold is None:
+        # AC-3: policy unconfigured — draft without placing and flag for escalation.
+        status = "threshold_unknown"
+        conn.execute(
+            "INSERT INTO purchase_orders VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (po_id, run_id, sku, supplier_id, qty, unit_price, total, need_by,
+             promised, status, datetime.now().isoformat(timespec="seconds")))
+        conn.commit()
+        conn.close()
+        gate_id = db.save_approval_gate(run_id, po_id, total, None, "uncertain")
+        return {
+            "po_id": po_id, "sku": sku, "supplier_id": supplier_id,
+            "supplier_name": name, "qty": qty, "unit_price": unit_price,
+            "total": total, "need_by": need_by, "promised_date": promised,
+            "status": status, "gate_id": gate_id,
+            "approval_required": True,
+            "message": (
+                "Approval threshold is not configured. The order has been "
+                "drafted but NOT placed. Call escalate_to_buyer — do not "
+                "proceed without a policy decision."),
+        }
+
+    needs_approval = total >= threshold
+    outcome = "requires_approval" if needs_approval else "auto_approved"
     status = "pending_approval" if needs_approval else "placed"
 
     conn.execute(
@@ -143,19 +205,25 @@ async def create_purchase_order(sku: str, supplier_id: str, qty: int,
     conn.commit()
     conn.close()
 
+    gate_id = db.save_approval_gate(run_id, po_id, total, threshold, outcome)
+
     result = {
         "po_id": po_id, "sku": sku, "supplier_id": supplier_id,
         "supplier_name": name, "qty": qty, "unit_price": unit_price,
         "total": total, "need_by": need_by, "promised_date": promised,
+<<<<<<< HEAD
         "lead_time_days": row["lead_time_days"],
         "status": status,
+=======
+        "status": status, "gate_id": gate_id,
+>>>>>>> 5cc810c78aa50a96c0ef8ee34d3d4fd182feb205
     }
     if needs_approval:
         result["approval_required"] = True
         result["message"] = (
             "${:,.2f} is at or above the ${:,.0f} approval threshold. "
             "The order is DRAFTED but NOT placed. Stop here and wait for the "
-            "buyer to approve or reject.".format(total, APPROVAL_THRESHOLD))
+            "buyer to approve or reject.".format(total, threshold))
     else:
         result["message"] = "Order placed with the supplier."
     return result
@@ -169,6 +237,10 @@ async def get_order_confirmation(po_id: str) -> dict:
     if po is None:
         conn.close()
         return {"error": "No purchase order " + po_id + "."}
+    if po["status"] == "threshold_unknown":
+        conn.close()
+        return {"error": po_id + " cannot be confirmed — approval threshold is "
+                "unconfigured. Call escalate_to_buyer."}
     if po["status"] == "pending_approval":
         conn.close()
         return {"error": po_id + " has not been placed yet - it is awaiting "
@@ -278,9 +350,102 @@ async def escalate_to_buyer(summary: str, options: list) -> dict:
             "message": "Surfaced to the buyer for a decision."}
 
 
+async def investigate_replenishment_need(sku: str, qty: int, need_by: str) -> dict:
+    """Full INVESTIGATE stage: inventory assessment, contract check, and
+    supplier quote collection in one deterministic call.
+
+    Runs all three lookups in parallel against seeded/mock data and captures
+    missing or low-confidence findings in structured lists so the DECIDE stage
+    and any escalation paths have complete context.
+    """
+    missing_data: list[dict] = []
+    low_confidence: list[dict] = []
+
+    inv_result, contract_result, raw_quotes = await asyncio.gather(
+        check_inventory(sku),
+        get_contract_terms(sku),
+        suppliers.fetch_all_quotes(sku, qty),
+    )
+
+    # Inventory assessment
+    if "error" in inv_result:
+        missing_data.append({
+            "field": "inventory",
+            "severity": "critical",
+            "detail": inv_result["error"],
+        })
+        inventory = None
+    else:
+        inventory = inv_result
+
+    # Contract check
+    if not contract_result.get("under_contract"):
+        missing_data.append({
+            "field": "contracts",
+            "severity": "medium",
+            "detail": "No active contract for {}. Open-market sourcing required.".format(sku),
+        })
+    contracts = contract_result
+
+    # Supplier quotes - surface gaps and reliability concerns
+    if not raw_quotes:
+        missing_data.append({
+            "field": "supplier_quotes",
+            "severity": "critical",
+            "detail": "No approved supplier carries {} at quantity {:,}.".format(sku, qty),
+        })
+    else:
+        if len(raw_quotes) == 1:
+            low_confidence.append({
+                "field": "supplier_quotes",
+                "detail": "Only one supplier quote received — competitive comparison not possible.",
+            })
+        for q in raw_quotes:
+            if q["fillable_qty"] < qty:
+                low_confidence.append({
+                    "field": "supplier_availability",
+                    "supplier_id": q["supplier_id"],
+                    "detail": "{} can only fill {:,} of {:,} requested units.".format(
+                        q["supplier_name"], q["fillable_qty"], qty),
+                })
+            note = q.get("supplier_note") or ""
+            if any(kw in note.lower() for kw in ("shutdown", "disruption", "maintenance")):
+                low_confidence.append({
+                    "field": "supplier_reliability",
+                    "supplier_id": q["supplier_id"],
+                    "detail": "Disruption note on {}: {}".format(q["supplier_name"], note),
+                })
+
+    return {
+        "sku": sku,
+        "qty_requested": qty,
+        "need_by": need_by,
+        "replenishment_needed": inventory["below_reorder_point"] if inventory else None,
+        "inventory": inventory,
+        "contracts": contracts,
+        "quotes": {"count": len(raw_quotes), "quotes": raw_quotes},
+        "missing_data": missing_data,
+        "low_confidence": low_confidence,
+        "data_complete": len(missing_data) == 0,
+    }
+
+
 # --- schemas + dispatch --------------------------------------------------
 
 TOOL_SCHEMAS = [
+    {"type": "function", "function": {
+        "name": "investigate_replenishment_need",
+        "description": (
+            "INVESTIGATE stage entry point. Checks inventory position, active contracts, "
+            "and collects supplier quotes in one parallel call. Returns structured "
+            "missing_data and low_confidence lists for anything that needs escalation. "
+            "Call this first at the start of every run."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "sku": {"type": "string", "description": "e.g. SKU-4471"},
+            "qty": {"type": "integer", "description": "Quantity to source"},
+            "need_by": {"type": "string", "description": "ISO date YYYY-MM-DD"}},
+            "required": ["sku", "qty", "need_by"]}}},
     {"type": "function", "function": {
         "name": "check_inventory",
         "description": "Current stock, reorder point and open POs for a SKU. Start here.",
@@ -343,6 +508,7 @@ TOOL_SCHEMAS = [
 ]
 
 DISPATCH = {
+    "investigate_replenishment_need": investigate_replenishment_need,
     "check_inventory": check_inventory,
     "get_contract_terms": get_contract_terms,
     "get_supplier_quotes": get_supplier_quotes,
@@ -358,7 +524,7 @@ async def call_tool(name: str, args: dict, run_id: str = "") -> dict:
     fn = DISPATCH.get(name)
     if fn is None:
         return {"error": "Unknown tool " + str(name) + "."}
-    if name == "create_purchase_order":
+    if name in ("create_purchase_order", "rank_suppliers"):
         args = dict(args, run_id=run_id)
     try:
         return await fn(**args)

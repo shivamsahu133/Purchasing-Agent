@@ -13,6 +13,10 @@ WEIGHTS = {"price": 0.35, "speed": 0.30, "reliability": 0.20, "contract": 0.15}
 # obvious choice was rejected) but pushed below every feasible one.
 INFEASIBLE_PENALTY = 0.30
 
+# When the top two feasible options are within this margin the selection is
+# flagged as low-confidence so the buyer can review before the PO is raised.
+LOW_CONFIDENCE_SCORE_GAP = 0.05
+
 
 def _clamp(x: float) -> float:
     return max(0.0, min(1.0, x))
@@ -79,6 +83,62 @@ def score_quotes(quotes: list[dict], qty: int, need_by: str,
     for i, s in enumerate(scored, 1):
         s["rank"] = i
     return scored
+
+
+def select_recommendation(ranked: list[dict]) -> dict:
+    """Pick the best feasible option and assess confidence in the choice.
+
+    Returns:
+      recommended_supplier_id  — None when no feasible option exists
+      confidence               — 'high' | 'low'
+      confidence_note          — reason when not 'high', else None
+      recommended_option       — full quote snapshot for the chosen supplier
+    """
+    feasible = [r for r in ranked if r["feasible"]]
+
+    if not feasible:
+        note = ("No quotes received — ranking impossible."
+                if not ranked else
+                "No feasible supplier can meet the requirement as specified.")
+        return {
+            "recommended_supplier_id": None,
+            "confidence": "low",
+            "confidence_note": note,
+            "recommended_option": None,
+        }
+
+    winner = feasible[0]
+    confidence: str = "high"
+    confidence_note: str | None = None
+
+    if len(feasible) == 1:
+        confidence = "low"
+        confidence_note = (
+            "Only one feasible supplier ({}) — no competitive comparison possible.".format(
+                winner["supplier_name"]))
+    elif feasible[0]["score"] - feasible[1]["score"] <= LOW_CONFIDENCE_SCORE_GAP:
+        gap = feasible[0]["score"] - feasible[1]["score"]
+        confidence = "low"
+        confidence_note = (
+            "{} and {} are within {:.3f} score points — "
+            "review manually before committing.".format(
+                feasible[0]["supplier_name"], feasible[1]["supplier_name"], gap))
+
+    return {
+        "recommended_supplier_id": winner["supplier_id"],
+        "confidence": confidence,
+        "confidence_note": confidence_note,
+        "recommended_option": {
+            "supplier_id": winner["supplier_id"],
+            "supplier_name": winner["supplier_name"],
+            "unit_price": winner["unit_price"],
+            "total_cost": winner["total_cost"],
+            "lead_time_days": winner["lead_time_days"],
+            "estimated_delivery": winner["estimated_delivery"],
+            "score": winner["score"],
+            "score_breakdown": winner["score_breakdown"],
+        },
+    }
 
 
 def explain_choice(ranked: list[dict]) -> str:
