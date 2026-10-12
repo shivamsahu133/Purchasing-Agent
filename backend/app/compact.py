@@ -104,7 +104,37 @@ def _validate_order(r: dict) -> dict:
     }
 
 
+def _investigate_replenishment_need(r: dict) -> dict:
+    out: dict = {
+        "sku": r["sku"],
+        "qty_requested": r["qty_requested"],
+        "need_by": r["need_by"],
+        "replenishment_needed": r["replenishment_needed"],
+        "data_complete": r["data_complete"],
+    }
+    if r.get("inventory"):
+        inv = r["inventory"]
+        out["inventory"] = {
+            "on_hand": inv["on_hand"],
+            "reorder_point": inv["reorder_point"],
+            "below_reorder_point": inv["below_reorder_point"],
+            "shortfall": inv["shortfall_vs_reorder_point"],
+            "open_po_count": len(inv["open_purchase_orders"]),
+        }
+    if r.get("contracts"):
+        out["contracts"] = _get_contract_terms(r["contracts"])
+    quotes_block = r.get("quotes") or {}
+    if quotes_block.get("count", 0) > 0:
+        out["quotes"] = [_quote(q) for q in quotes_block["quotes"]]
+    if r.get("missing_data"):
+        out["missing_data"] = r["missing_data"]
+    if r.get("low_confidence"):
+        out["low_confidence"] = r["low_confidence"]
+    return out
+
+
 COMPACTORS = {
+    "investigate_replenishment_need": _investigate_replenishment_need,
     "check_inventory": _check_inventory,
     "get_contract_terms": _get_contract_terms,
     "get_supplier_quotes": _get_supplier_quotes,
