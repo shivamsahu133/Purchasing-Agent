@@ -77,6 +77,24 @@ CREATE TABLE IF NOT EXISTS confirmations (
     promised_date TEXT NOT NULL,
     received_at TEXT NOT NULL
 );
+-- DECIDE stage: one row per rank_suppliers call recording the selected option.
+CREATE TABLE IF NOT EXISTS decisions (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    sku TEXT NOT NULL,
+    qty INTEGER NOT NULL,
+    need_by TEXT NOT NULL,
+    recommended_supplier_id TEXT,
+    recommended_unit_price REAL,
+    recommended_total REAL,
+    recommended_lead_time_days INTEGER,
+    recommended_estimated_delivery TEXT,
+    feasible_count INTEGER NOT NULL,
+    confidence TEXT NOT NULL,
+    confidence_note TEXT,
+    rationale TEXT NOT NULL,
+    decided_at TEXT NOT NULL
+);
 -- One row per create_purchase_order call: records whether the order was
 -- auto-approved, held for human approval, or blocked because the threshold
 -- policy is unconfigured.
@@ -145,7 +163,7 @@ def reset_and_seed() -> None:
     conn = connect()
     conn.executescript(SCHEMA)
     for table in ("inventory", "suppliers", "contracts", "catalog",
-                  "purchase_orders", "confirmations", "approval_gates"):
+                  "purchase_orders", "confirmations", "decisions", "approval_gates"):
         conn.execute(f"DELETE FROM {table}")
     conn.executemany("INSERT INTO inventory VALUES (?,?,?,?,?)", INVENTORY)
     conn.executemany("INSERT INTO suppliers VALUES (?,?,?,?)", SUPPLIERS)
@@ -184,10 +202,13 @@ def export_run_state(run_id: str) -> dict:
         confirmations = [dict(r) for r in conn.execute(
             "SELECT * FROM confirmations WHERE po_id IN (" + marks + ")",
             ids).fetchall()]
+    decisions = [dict(r) for r in conn.execute(
+        "SELECT * FROM decisions WHERE run_id = ?", (run_id,)).fetchall()]
     gates = [dict(r) for r in conn.execute(
         "SELECT * FROM approval_gates WHERE run_id = ?", (run_id,)).fetchall()]
     conn.close()
-    return {"orders": orders, "confirmations": confirmations, "gates": gates}
+    return {"orders": orders, "confirmations": confirmations,
+            "decisions": decisions, "gates": gates}
 
 
 def import_run_state(state: dict | None) -> None:
@@ -206,12 +227,43 @@ def import_run_state(state: dict | None) -> None:
         conn.execute("INSERT OR REPLACE INTO confirmations VALUES (?,?,?,?,?)",
                      (c["po_id"], c["confirmed_unit_price"], c["confirmed_qty"],
                       c["promised_date"], c["received_at"]))
+    for d in state.get("decisions") or []:
+        conn.execute(
+            "INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (d["id"], d["run_id"], d["sku"], d["qty"], d["need_by"],
+             d["recommended_supplier_id"], d["recommended_unit_price"],
+             d["recommended_total"], d["recommended_lead_time_days"],
+             d["recommended_estimated_delivery"], d["feasible_count"],
+             d["confidence"], d["confidence_note"], d["rationale"], d["decided_at"]))
     for g in state.get("gates") or []:
         conn.execute("INSERT OR REPLACE INTO approval_gates VALUES (?,?,?,?,?,?,?)",
                      (g["id"], g["run_id"], g["po_id"], g["order_total"],
                       g["threshold_used"], g["outcome"], g["decided_at"]))
     conn.commit()
     conn.close()
+
+
+def save_decision(run_id: str, sku: str, qty: int, need_by: str,
+                  ranked: list, recommendation: dict, rationale: str) -> str:
+    """Persist the DECIDE stage recommendation and return its id."""
+    decision_id = "DEC-" + uuid.uuid4().hex[:8].upper()
+    rec = recommendation.get("recommended_option") or {}
+    feasible_count = sum(1 for r in ranked if r.get("feasible"))
+    conn = connect()
+    conn.execute(
+        "INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (decision_id, run_id, sku, qty, need_by,
+         recommendation.get("recommended_supplier_id"),
+         rec.get("unit_price"), rec.get("total_cost"),
+         rec.get("lead_time_days"), rec.get("estimated_delivery"),
+         feasible_count,
+         recommendation["confidence"],
+         recommendation.get("confidence_note"),
+         rationale,
+         datetime.now().isoformat(timespec="seconds")))
+    conn.commit()
+    conn.close()
+    return decision_id
 
 
 def save_approval_gate(run_id: str, po_id: str, order_total: float,

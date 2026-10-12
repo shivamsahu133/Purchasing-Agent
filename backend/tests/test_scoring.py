@@ -88,3 +88,68 @@ def test_explanation_names_the_runner_up():
 def test_explanation_is_honest_when_nothing_is_viable():
     ranked = scoring.score_quotes([quote("A", 4.0, 40, avail=10)], 100, NEED_BY)
     assert "No supplier can meet" in scoring.explain_choice(ranked)
+
+
+# --- select_recommendation -----------------------------------------------
+
+def test_select_recommendation_picks_the_top_feasible_option():
+    ranked = scoring.score_quotes([
+        quote("CHEAP", 4.0, 5, avail=9999),
+        quote("PRICEY", 9.0, 5, avail=9999, rel=0.5),
+    ], 100, NEED_BY)
+    result = scoring.select_recommendation(ranked)
+    assert result["recommended_supplier_id"] == "CHEAP"
+    assert result["recommended_option"]["supplier_id"] == "CHEAP"
+
+
+def test_select_recommendation_high_confidence_when_clear_winner():
+    ranked = scoring.score_quotes([
+        quote("A", 4.0, 5, avail=9999),
+        quote("B", 9.0, 9, avail=9999, rel=0.5),
+    ], 100, NEED_BY)
+    result = scoring.select_recommendation(ranked)
+    assert result["confidence"] == "high"
+    assert result["confidence_note"] is None
+
+
+def test_select_recommendation_low_confidence_when_only_one_feasible():
+    ranked = scoring.score_quotes([
+        quote("GOOD", 5.0, 5, avail=9999),
+        quote("LATE", 5.0, 40, avail=9999),
+    ], 100, NEED_BY)
+    result = scoring.select_recommendation(ranked)
+    assert result["confidence"] == "low"
+    assert "GOOD" in result["confidence_note"]
+
+
+def test_select_recommendation_low_confidence_on_near_tie():
+    ranked = scoring.score_quotes([
+        quote("A", 5.0, 5, avail=9999, rel=0.9),
+        quote("B", 5.0, 5, avail=9999, rel=0.9),
+    ], 100, NEED_BY)
+    result = scoring.select_recommendation(ranked)
+    assert result["confidence"] == "low"
+    assert result["recommended_supplier_id"] is not None
+
+
+def test_select_recommendation_returns_none_when_no_feasible_options():
+    ranked = scoring.score_quotes([quote("A", 5.0, 40, avail=10)], 100, NEED_BY)
+    result = scoring.select_recommendation(ranked)
+    assert result["recommended_supplier_id"] is None
+    assert result["recommended_option"] is None
+
+
+def test_select_recommendation_returns_none_for_empty_input():
+    result = scoring.select_recommendation([])
+    assert result["recommended_supplier_id"] is None
+
+
+def test_select_recommendation_option_snapshot_has_required_fields():
+    ranked = scoring.score_quotes([
+        quote("A", 4.0, 5, avail=9999),
+        quote("B", 9.0, 9, avail=9999, rel=0.5),
+    ], 100, NEED_BY)
+    opt = scoring.select_recommendation(ranked)["recommended_option"]
+    for field in ("supplier_id", "supplier_name", "unit_price", "total_cost",
+                  "lead_time_days", "estimated_delivery", "score", "score_breakdown"):
+        assert field in opt, f"missing field: {field}"
