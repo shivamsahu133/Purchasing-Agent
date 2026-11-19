@@ -3,6 +3,7 @@
 Seeded deterministically so the demo tells the same story on every run.
 Dates are stored relative to "today" so the scenario never goes stale.
 """
+import json
 import sqlite3
 import uuid
 import os
@@ -76,6 +77,18 @@ CREATE TABLE IF NOT EXISTS confirmations (
     confirmed_qty INTEGER NOT NULL,
     promised_date TEXT NOT NULL,
     received_at TEXT NOT NULL
+);
+-- Audit trail for every deterministic ranking call.
+CREATE TABLE IF NOT EXISTS ranking_results (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    sku TEXT NOT NULL,
+    qty INTEGER NOT NULL,
+    need_by TEXT NOT NULL,
+    policy_json TEXT NOT NULL,
+    ranked_json TEXT NOT NULL,
+    recommendation TEXT,
+    ranked_at TEXT NOT NULL
 );
 -- DECIDE stage: one row per rank_suppliers call recording the selected option.
 CREATE TABLE IF NOT EXISTS decisions (
@@ -163,7 +176,8 @@ def reset_and_seed() -> None:
     conn = connect()
     conn.executescript(SCHEMA)
     for table in ("inventory", "suppliers", "contracts", "catalog",
-                  "purchase_orders", "confirmations", "decisions", "approval_gates"):
+                  "purchase_orders", "confirmations", "ranking_results",
+                  "decisions", "approval_gates"):
         conn.execute(f"DELETE FROM {table}")
     conn.executemany("INSERT INTO inventory VALUES (?,?,?,?,?)", INVENTORY)
     conn.executemany("INSERT INTO suppliers VALUES (?,?,?,?)", SUPPLIERS)
@@ -185,6 +199,26 @@ def ensure_seeded() -> None:
     conn.close()
     if empty:
         reset_and_seed()
+
+
+# --- ranking audit -------------------------------------------------------
+
+def save_ranking_result(run_id: str, sku: str, qty: int, need_by: str,
+                        policy: dict, ranked: list,
+                        recommendation: str | None) -> None:
+    """Persist the inputs and outputs of one deterministic ranking call."""
+    now = datetime.now().isoformat(timespec="seconds")
+    # Include microseconds so multiple rankings in one run don't collide.
+    row_id = "{}|{}|{}".format(run_id or "_", sku,
+                                datetime.now().isoformat(timespec="microseconds"))
+    conn = connect()
+    conn.execute(
+        "INSERT OR REPLACE INTO ranking_results VALUES (?,?,?,?,?,?,?,?,?)",
+        (row_id, run_id, sku, qty, need_by,
+         json.dumps(policy), json.dumps(ranked, default=str),
+         recommendation, now))
+    conn.commit()
+    conn.close()
 
 
 # --- run state travel ----------------------------------------------------

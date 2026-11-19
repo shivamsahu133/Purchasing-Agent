@@ -110,7 +110,12 @@ async def get_supplier_quotes(sku: str, qty: int) -> dict:
 
 async def rank_suppliers(sku: str, qty: int, need_by: str,
                          budget: float = None, run_id: str = "") -> dict:
-    """Score every live quote, select a recommendation, and persist the decision."""
+    """Score every live quote, select a recommendation, and persist the decision.
+
+    Uses scoring.DEFAULT_POLICY for weights and thresholds. The ranking is
+    computed entirely in code — the model reads the result and explains it,
+    but never controls a number that affects which supplier wins.
+    """
     quotes = await suppliers.fetch_all_quotes(sku, qty)
     ranked = scoring.score_quotes(quotes, qty, need_by, budget)
     recommendation = scoring.select_recommendation(ranked)
@@ -120,11 +125,14 @@ async def rank_suppliers(sku: str, qty: int, need_by: str,
     if run_id:
         decision_id = db.save_decision(
             run_id, sku, qty, need_by, ranked, recommendation, rationale)
+    db.save_ranking_result(run_id, sku, qty, need_by, scoring.DEFAULT_POLICY,
+                           ranked, recommendation["recommended_supplier_id"])
 
     return {
         "sku": sku,
         "qty": qty,
         "need_by": need_by,
+        "policy_applied": scoring.DEFAULT_POLICY,
         "weights_used": scoring.WEIGHTS,
         "ranked_options": ranked,
         "feasible_count": sum(1 for r in ranked if r["feasible"]),
@@ -211,12 +219,8 @@ async def create_purchase_order(sku: str, supplier_id: str, qty: int,
         "po_id": po_id, "sku": sku, "supplier_id": supplier_id,
         "supplier_name": name, "qty": qty, "unit_price": unit_price,
         "total": total, "need_by": need_by, "promised_date": promised,
-<<<<<<< HEAD
         "lead_time_days": row["lead_time_days"],
-        "status": status,
-=======
         "status": status, "gate_id": gate_id,
->>>>>>> 5cc810c78aa50a96c0ef8ee34d3d4fd182feb205
     }
     if needs_approval:
         result["approval_required"] = True
