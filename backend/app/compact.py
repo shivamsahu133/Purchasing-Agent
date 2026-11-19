@@ -68,13 +68,28 @@ def _get_supplier_quotes(r: dict) -> dict:
 
 
 def _rank_suppliers(r: dict) -> dict:
-    return {
+    out = {
         "sku": r["sku"], "qty": r["qty"], "need_by": r["need_by"],
         "options": [_option(o) for o in r["ranked_options"]],
         "feasible_count": r["feasible_count"],
         "recommendation": r["recommendation"],
+        "confidence": r["confidence"],
         "rationale": r["rationale"],
     }
+    if r.get("confidence_note"):
+        out["confidence_note"] = r["confidence_note"]
+    if r.get("recommendation_detail"):
+        d = r["recommendation_detail"]
+        out["recommendation_detail"] = {
+            "supplier_id": d["supplier_id"],
+            "supplier_name": d["supplier_name"],
+            "unit_price": d["unit_price"],
+            "total_cost": d["total_cost"],
+            "lead_time_days": d["lead_time_days"],
+            "estimated_delivery": d["estimated_delivery"],
+            "score": d["score"],
+        }
+    return out
 
 
 def _validate_order(r: dict) -> dict:
@@ -89,7 +104,37 @@ def _validate_order(r: dict) -> dict:
     }
 
 
+def _investigate_replenishment_need(r: dict) -> dict:
+    out: dict = {
+        "sku": r["sku"],
+        "qty_requested": r["qty_requested"],
+        "need_by": r["need_by"],
+        "replenishment_needed": r["replenishment_needed"],
+        "data_complete": r["data_complete"],
+    }
+    if r.get("inventory"):
+        inv = r["inventory"]
+        out["inventory"] = {
+            "on_hand": inv["on_hand"],
+            "reorder_point": inv["reorder_point"],
+            "below_reorder_point": inv["below_reorder_point"],
+            "shortfall": inv["shortfall_vs_reorder_point"],
+            "open_po_count": len(inv["open_purchase_orders"]),
+        }
+    if r.get("contracts"):
+        out["contracts"] = _get_contract_terms(r["contracts"])
+    quotes_block = r.get("quotes") or {}
+    if quotes_block.get("count", 0) > 0:
+        out["quotes"] = [_quote(q) for q in quotes_block["quotes"]]
+    if r.get("missing_data"):
+        out["missing_data"] = r["missing_data"]
+    if r.get("low_confidence"):
+        out["low_confidence"] = r["low_confidence"]
+    return out
+
+
 COMPACTORS = {
+    "investigate_replenishment_need": _investigate_replenishment_need,
     "check_inventory": _check_inventory,
     "get_contract_terms": _get_contract_terms,
     "get_supplier_quotes": _get_supplier_quotes,

@@ -49,9 +49,12 @@ Today is {today}.
 
 Work in four stages, and do not skip any of them:
 
-1. INVESTIGATE. Establish the facts before you form a view. Check stock, check
-   whether the SKU is under contract, then get quotes from every supplier. Never
-   assume a price or a lead time - read it from a tool.
+1. INVESTIGATE. Call investigate_replenishment_need first. It checks stock,
+   active contracts, and collects supplier quotes in one pass, and flags any
+   missing_data or low_confidence entries you must handle. Read those lists
+   before moving on - critical missing data may block the order and must be
+   escalated; low-confidence items must be noted in your summary.
+   Never assume a price or a lead time - read it from a tool.
    If the buyer states a quantity, source exactly that quantity. Do not net it
    off against stock on hand or silently round it. If you think a different
    quantity is the right call, order what was asked and flag your
@@ -84,6 +87,7 @@ class Run:
         self.request = request
         self.status = "running"
         self.pending_po: dict | None = None
+        self.investigation: dict | None = None
         self.messages: list[dict] = [
             {"role": "system",
              "content": SYSTEM_PROMPT.format(today=date.today().isoformat())},
@@ -204,6 +208,10 @@ async def drive(run: Run):
             yield {"type": "tool_result", "id": tc.id, "name": name,
                    "result": result}
 
+            if (name == "investigate_replenishment_need"
+                    and isinstance(result, dict) and "error" not in result):
+                run.investigation = result
+
             # Full payload to the browser (above), compact one into context.
             run.messages.append({
                 "role": "tool", "tool_call_id": tc.id, "name": name,
@@ -223,6 +231,7 @@ async def drive(run: Run):
                            "run_id": run.id,
                            "messages": run.messages,
                            "pending_po": result,
+                           "investigation": run.investigation,
                            **db.export_run_state(run.id),
                        }}
                 return
@@ -256,6 +265,7 @@ def _rehydrate(run_id: str, token: dict | None) -> Run | None:
     rebuilt = Run(token.get("run_id") or run_id, "")
     rebuilt.messages = token["messages"]
     rebuilt.pending_po = token.get("pending_po")
+    rebuilt.investigation = token.get("investigation")
     rebuilt.status = "awaiting_approval"
     RUNS[rebuilt.id] = rebuilt
     return rebuilt
