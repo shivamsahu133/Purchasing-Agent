@@ -128,10 +128,13 @@ def orders():
     db.ensure_seeded()
     conn = db.connect()
     rows = conn.execute(
-        "SELECT p.*, s.name AS supplier_name, c.lead_time_days "
+        "SELECT p.*, s.name AS supplier_name, c.lead_time_days, "
+        "a.id AS action_id, a.outcome AS action_outcome, "
+        "a.channel AS action_channel, a.executed_at AS submitted_at "
         "FROM purchase_orders p "
         "JOIN suppliers s ON s.id = p.supplier_id "
         "LEFT JOIN catalog c ON c.supplier_id = p.supplier_id AND c.sku = p.sku "
+        "LEFT JOIN order_actions a ON a.po_id = p.id "
         "ORDER BY p.created_at DESC").fetchall()
     conn.close()
     return {"orders": [dict(r) for r in rows]}

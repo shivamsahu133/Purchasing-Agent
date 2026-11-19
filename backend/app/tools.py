@@ -211,6 +211,10 @@ async def create_purchase_order(sku: str, supplier_id: str, qty: int,
         "INSERT INTO purchase_orders VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (po_id, run_id, sku, supplier_id, qty, unit_price, total, need_by,
          promised, status, datetime.now().isoformat(timespec="seconds")))
+    # Below the threshold the order goes out now. Above it, nothing is
+    # submitted until the buyer approves (see db.resolve_pending_approval).
+    action_id = None if needs_approval else db.record_order_submission(
+        conn, po_id, run_id)
     conn.commit()
     conn.close()
 
@@ -223,6 +227,7 @@ async def create_purchase_order(sku: str, supplier_id: str, qty: int,
         "lead_time_days": row["lead_time_days"],
         "status": status, "gate_id": gate_id,
         "approval_threshold": threshold,
+        "action_id": action_id,
     }
     if needs_approval:
         result["approval_required"] = True
@@ -251,6 +256,12 @@ async def get_order_confirmation(po_id: str) -> dict:
         conn.close()
         return {"error": po_id + " has not been placed yet - it is awaiting "
                 "buyer approval. No confirmation exists."}
+    submitted = conn.execute("SELECT 1 FROM order_actions WHERE po_id = ?",
+                             (po_id,)).fetchone()
+    if po["status"] != "placed" or submitted is None:
+        conn.close()
+        return {"error": po_id + " was never submitted to the supplier (status: "
+                + po["status"] + "). No confirmation exists."}
 
     existing = conn.execute("SELECT * FROM confirmations WHERE po_id = ?",
                             (po_id,)).fetchone()
@@ -330,8 +341,11 @@ async def validate_order(po_id: str) -> dict:
         })
 
     passed = not discrepancies
+    action = db.get_order_action(po_id)
     return {
         "po_id": po_id,
+        "submission": action and {k: action[k] for k in (
+            "id", "channel", "outcome", "executed_at")},
         "validation_passed": passed,
         "discrepancy_count": len(discrepancies),
         "discrepancies": discrepancies,

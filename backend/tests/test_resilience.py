@@ -45,11 +45,7 @@ async def test_compaction_keeps_what_the_model_needs_to_decide():
 
 async def test_compaction_preserves_every_validation_discrepancy():
     po = await tools.create_purchase_order("SKU-4471", "S-002", 2500, NEED_BY)
-    conn = db.connect()
-    conn.execute("UPDATE purchase_orders SET status='placed' WHERE id=?",
-                 (po["po_id"],))
-    conn.commit()
-    conn.close()
+    assert db.resolve_pending_approval("", po["po_id"], approved=True)
     await tools.get_order_confirmation(po["po_id"])
 
     full = await tools.validate_order(po["po_id"])

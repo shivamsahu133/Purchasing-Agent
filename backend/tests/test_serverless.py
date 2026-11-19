@@ -76,12 +76,7 @@ async def test_validation_still_works_after_a_cold_start():
 
     cold_start()
     agent._rehydrate("run-3", token)
-
-    conn = db.connect()
-    conn.execute("UPDATE purchase_orders SET status='placed' WHERE id=?",
-                 (po["po_id"],))
-    conn.commit()
-    conn.close()
+    assert db.resolve_pending_approval("run-3", po["po_id"], approved=True)
 
     await tools.get_order_confirmation(po["po_id"])
     result = await tools.validate_order(po["po_id"])

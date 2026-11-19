@@ -77,11 +77,7 @@ async def test_no_confirmation_exists_before_approval():
 async def test_validation_catches_a_reprice_and_a_late_delivery():
     """The seeded scenario: Apex confirms at +4% and two days late."""
     po = await tools.create_purchase_order("SKU-4471", "S-002", 2500, NEED_BY)
-    conn = db.connect()
-    conn.execute("UPDATE purchase_orders SET status='placed' WHERE id=?",
-                 (po["po_id"],))
-    conn.commit()
-    conn.close()
+    assert db.resolve_pending_approval("", po["po_id"], approved=True)
 
     await tools.get_order_confirmation(po["po_id"])
     r = await tools.validate_order(po["po_id"])

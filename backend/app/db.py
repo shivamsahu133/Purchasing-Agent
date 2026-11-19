@@ -149,6 +149,20 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     decided_at TEXT,
     decision_note TEXT
 );
+-- The order action itself: one row per PO actually submitted to the supplier.
+-- There is no live ERP; submission goes to the seeded mock supplier, whose
+-- acknowledgement arrives later in `confirmations`. A PO held for approval
+-- has no row here until the buyer approves it.
+CREATE TABLE IF NOT EXISTS order_actions (
+    id TEXT PRIMARY KEY,
+    po_id TEXT NOT NULL UNIQUE,
+    run_id TEXT,
+    action TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    detail TEXT,
+    executed_at TEXT NOT NULL
+);
 -- Conditions after an approval decision that need a human to look again.
 -- trigger: approval_rejected (buyer denied the PO) or run_stalled (the run
 -- could not finish after the decision).
@@ -218,7 +232,7 @@ def reset_and_seed() -> None:
     for table in ("inventory", "suppliers", "contracts", "catalog",
                   "purchase_orders", "confirmations", "quote_results",
                   "ranking_results", "decisions", "approval_gates",
-                  "pending_approvals", "escalations"):
+                  "pending_approvals", "escalations", "order_actions"):
         conn.execute(f"DELETE FROM {table}")
     conn.executemany("INSERT INTO inventory VALUES (?,?,?,?,?)", INVENTORY)
     conn.executemany("INSERT INTO suppliers VALUES (?,?,?,?)", SUPPLIERS)
@@ -315,11 +329,13 @@ def export_run_state(run_id: str) -> dict:
         "SELECT * FROM approval_gates WHERE run_id = ?", (run_id,)).fetchall()]
     pending = [dict(r) for r in conn.execute(
         "SELECT * FROM pending_approvals WHERE run_id = ?", (run_id,)).fetchall()]
+    actions = [dict(r) for r in conn.execute(
+        "SELECT * FROM order_actions WHERE run_id = ?", (run_id,)).fetchall()]
     conn.close()
     return {"orders": orders, "confirmations": confirmations,
             "quote_results": quote_results,
             "decisions": decisions, "gates": gates,
-            "pending_approvals": pending}
+            "pending_approvals": pending, "order_actions": actions}
 
 
 def import_run_state(state: dict | None) -> None:
@@ -358,6 +374,11 @@ def import_run_state(state: dict | None) -> None:
         conn.execute("INSERT OR REPLACE INTO approval_gates VALUES (?,?,?,?,?,?,?)",
                      (g["id"], g["run_id"], g["po_id"], g["order_total"],
                       g["threshold_used"], g["outcome"], g["decided_at"]))
+    for a in state.get("order_actions") or []:
+        conn.execute(
+            "INSERT OR IGNORE INTO order_actions VALUES (?,?,?,?,?,?,?,?)",
+            (a["id"], a["po_id"], a["run_id"], a["action"], a["channel"],
+             a["outcome"], a["detail"], a["executed_at"]))
     for a in state.get("pending_approvals") or []:
         # Never overwrite a decision this instance already recorded.
         conn.execute(
@@ -461,6 +482,10 @@ def resolve_pending_approval(run_id: str, po_id: str, approved: bool,
     if cur.rowcount == 0:
         conn.close()
         return False
+    if approved:
+        # Same transaction as the status change: the order is never placed
+        # without its submission being recorded, or the other way round.
+        record_order_submission(conn, po_id, run_id)
     conn.execute(
         "UPDATE pending_approvals SET status = ?, decided_at = ?, "
         "decision_note = ? WHERE run_id = ?",
@@ -491,3 +516,29 @@ def get_escalations(run_id: str) -> list[dict]:
         (run_id,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# --- order action --------------------------------------------------------
+
+def record_order_submission(conn: sqlite3.Connection, po_id: str,
+                            run_id: str | None) -> str:
+    """Record that a PO was submitted to the (mock) supplier.
+
+    Takes the caller's connection so it commits together with the PO status
+    change. The UNIQUE po_id means a PO can only ever be submitted once.
+    """
+    action_id = "ACT-" + uuid.uuid4().hex[:8].upper()
+    conn.execute(
+        "INSERT INTO order_actions VALUES (?,?,?,?,?,?,?,?)",
+        (action_id, po_id, run_id, "submit", "mock_supplier", "submitted",
+         "Recorded against seeded supplier data; no live ERP connection.",
+         datetime.now().isoformat(timespec="seconds")))
+    return action_id
+
+
+def get_order_action(po_id: str) -> dict | None:
+    conn = connect()
+    row = conn.execute("SELECT * FROM order_actions WHERE po_id = ?",
+                       (po_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
