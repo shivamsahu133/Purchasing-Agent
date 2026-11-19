@@ -98,6 +98,27 @@ class Run:
 RUNS: dict[str, Run] = {}
 
 
+def approval_context(run_id: str, po: dict) -> dict:
+    """What the UI needs to show the decision and call POST /api/approve."""
+    return {
+        "run_id": run_id,
+        "po_id": po.get("po_id"),
+        "gate_id": po.get("gate_id"),
+        "status": po.get("status"),
+        "sku": po.get("sku"),
+        "supplier_id": po.get("supplier_id"),
+        "supplier_name": po.get("supplier_name"),
+        "qty": po.get("qty"),
+        "unit_price": po.get("unit_price"),
+        "total": po.get("total"),
+        "approval_threshold": po.get("approval_threshold"),
+        "need_by": po.get("need_by"),
+        "promised_date": po.get("promised_date"),
+        "reason": po.get("message"),
+        "approve_endpoint": "/api/approve",
+    }
+
+
 def _assistant_message(msg) -> dict:
     """Convert the SDK message object into a plain dict for the history."""
     out: dict = {"role": "assistant", "content": msg.content or ""}
@@ -222,11 +243,20 @@ async def drive(run: Run):
             if isinstance(result, dict) and result.get("approval_required"):
                 run.status = "awaiting_approval"
                 run.pending_po = result
+                # The order is drafted, not placed. Park the run in SQLite so
+                # the approval can arrive after a restart.
+                approval = approval_context(run.id, result)
+                db.save_pending_approval(run.id, approval, run.messages,
+                                         run.investigation)
                 # The run suspends here, possibly for minutes. On a stateless
                 # platform the next request may reach a different instance, so
-                # everything needed to resume goes back to the client and
+                # everything needed to resume also goes back to the client and
                 # returns with the approval.
-                yield {"type": "awaiting_approval", "po": result,
+                yield {"type": "awaiting_approval",
+                       "status": "awaiting_approval",
+                       "run_id": run.id,
+                       "approval": approval,
+                       "po": result,
                        "resume_token": {
                            "run_id": run.id,
                            "messages": run.messages,
@@ -252,16 +282,31 @@ def _rehydrate(run_id: str, token: dict | None) -> Run | None:
     """Rebuild a suspended run.
 
     Prefers the in-process cache, which is what a local server or a warm
-    instance will have. Falls back to the token the client sent back, which is
-    what makes the approval gate survive a cold start.
+    instance will have. Then the pending_approvals row in SQLite, which
+    survives a restart. Falls back to the token the client sent back, which is
+    what makes the approval gate survive a cold start on a stateless host.
     """
     run = RUNS.get(run_id)
     if run is not None and run.status == "awaiting_approval":
         return run
+
+    if token:
+        db.import_run_state(token)
+    saved = db.get_pending_approval(run_id)
+    if saved is not None:
+        if saved["status"] != "pending":
+            return None
+        rebuilt = Run(run_id, "")
+        rebuilt.messages = saved["messages"]
+        rebuilt.pending_po = {"po_id": saved["po_id"], **saved["approval"]}
+        rebuilt.investigation = saved["investigation"]
+        rebuilt.status = "awaiting_approval"
+        RUNS[run_id] = rebuilt
+        return rebuilt
+
     if not token or not token.get("messages"):
         return None
 
-    db.import_run_state(token)
     rebuilt = Run(token.get("run_id") or run_id, "")
     rebuilt.messages = token["messages"]
     rebuilt.pending_po = token.get("pending_po")
@@ -282,11 +327,12 @@ async def resume(run_id: str, approved: bool, note: str = "",
         return
 
     po_id = (run.pending_po or {}).get("po_id", "")
-    conn = db.connect()
-    conn.execute("UPDATE purchase_orders SET status = ? WHERE id = ?",
-                 ("placed" if approved else "rejected", po_id))
-    conn.commit()
-    conn.close()
+    if not db.resolve_pending_approval(run.id, po_id, approved, note):
+        run.status = "done"
+        yield {"type": "error",
+               "message": po_id + " is not awaiting approval - it has already "
+                          "been decided. Nothing was changed."}
+        return
 
     if approved:
         instruction = (

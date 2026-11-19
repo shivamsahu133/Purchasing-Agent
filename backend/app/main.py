@@ -72,6 +72,24 @@ async def approve(body: ApprovalRequest):
         media_type="application/x-ndjson", headers=STREAM_HEADERS)
 
 
+@app.get("/api/runs/{run_id}")
+def run_state(run_id: str):
+    """Approval state of a run, read from SQLite, so the UI can re-prompt."""
+    db.ensure_seeded()
+    saved = db.get_pending_approval(run_id)
+    if saved is None:
+        live = agent.RUNS.get(run_id)
+        return {"run_id": run_id,
+                "status": live.status if live else "unknown",
+                "approval": None}
+    status = ("awaiting_approval" if saved["status"] == "pending"
+              else saved["status"])
+    return {"run_id": run_id, "status": status,
+            "approval": saved["approval"],
+            "decided_at": saved["decided_at"],
+            "decision_note": saved["decision_note"]}
+
+
 @app.get("/api/scenario")
 def scenario():
     """Seed context for the UI, and the demo request pre-filled for the buyer."""

@@ -195,6 +195,7 @@ async def create_purchase_order(sku: str, supplier_id: str, qty: int,
             "supplier_name": name, "qty": qty, "unit_price": unit_price,
             "total": total, "need_by": need_by, "promised_date": promised,
             "status": status, "gate_id": gate_id,
+            "approval_threshold": None,
             "approval_required": True,
             "message": (
                 "Approval threshold is not configured. The order has been "
@@ -221,6 +222,7 @@ async def create_purchase_order(sku: str, supplier_id: str, qty: int,
         "total": total, "need_by": need_by, "promised_date": promised,
         "lead_time_days": row["lead_time_days"],
         "status": status, "gate_id": gate_id,
+        "approval_threshold": threshold,
     }
     if needs_approval:
         result["approval_required"] = True

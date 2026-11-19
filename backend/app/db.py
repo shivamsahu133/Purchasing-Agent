@@ -135,6 +135,20 @@ CREATE TABLE IF NOT EXISTS approval_gates (
     outcome TEXT NOT NULL,
     decided_at TEXT NOT NULL
 );
+-- A run parked at the approval gate. Holds everything needed to resume it, so
+-- an approval can arrive after a restart. status: pending, approved, rejected.
+CREATE TABLE IF NOT EXISTS pending_approvals (
+    run_id TEXT PRIMARY KEY,
+    po_id TEXT NOT NULL,
+    gate_id TEXT,
+    status TEXT NOT NULL,
+    approval_json TEXT NOT NULL,
+    messages_json TEXT NOT NULL,
+    investigation_json TEXT,
+    created_at TEXT NOT NULL,
+    decided_at TEXT,
+    decision_note TEXT
+);
 """
 
 # --- seed ----------------------------------------------------------------
@@ -192,7 +206,8 @@ def reset_and_seed() -> None:
     conn.executescript(SCHEMA)
     for table in ("inventory", "suppliers", "contracts", "catalog",
                   "purchase_orders", "confirmations", "quote_results",
-                  "ranking_results", "decisions", "approval_gates"):
+                  "ranking_results", "decisions", "approval_gates",
+                  "pending_approvals"):
         conn.execute(f"DELETE FROM {table}")
     conn.executemany("INSERT INTO inventory VALUES (?,?,?,?,?)", INVENTORY)
     conn.executemany("INSERT INTO suppliers VALUES (?,?,?,?)", SUPPLIERS)
@@ -287,10 +302,13 @@ def export_run_state(run_id: str) -> dict:
         "SELECT * FROM decisions WHERE run_id = ?", (run_id,)).fetchall()]
     gates = [dict(r) for r in conn.execute(
         "SELECT * FROM approval_gates WHERE run_id = ?", (run_id,)).fetchall()]
+    pending = [dict(r) for r in conn.execute(
+        "SELECT * FROM pending_approvals WHERE run_id = ?", (run_id,)).fetchall()]
     conn.close()
     return {"orders": orders, "confirmations": confirmations,
             "quote_results": quote_results,
-            "decisions": decisions, "gates": gates}
+            "decisions": decisions, "gates": gates,
+            "pending_approvals": pending}
 
 
 def import_run_state(state: dict | None) -> None:
@@ -329,6 +347,13 @@ def import_run_state(state: dict | None) -> None:
         conn.execute("INSERT OR REPLACE INTO approval_gates VALUES (?,?,?,?,?,?,?)",
                      (g["id"], g["run_id"], g["po_id"], g["order_total"],
                       g["threshold_used"], g["outcome"], g["decided_at"]))
+    for a in state.get("pending_approvals") or []:
+        # Never overwrite a decision this instance already recorded.
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_approvals VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (a["run_id"], a["po_id"], a["gate_id"], a["status"],
+             a["approval_json"], a["messages_json"], a["investigation_json"],
+             a["created_at"], a["decided_at"], a["decision_note"]))
     conn.commit()
     conn.close()
 
@@ -374,3 +399,61 @@ def save_approval_gate(run_id: str, po_id: str, order_total: float,
     conn.commit()
     conn.close()
     return gate_id
+
+
+# --- approval gate persistence -------------------------------------------
+
+def save_pending_approval(run_id: str, approval: dict, messages: list,
+                          investigation: dict | None) -> None:
+    """Persist a run parked at the approval gate so it can be resumed later."""
+    conn = connect()
+    conn.execute(
+        "INSERT OR REPLACE INTO pending_approvals VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (run_id, approval["po_id"], approval.get("gate_id"), "pending",
+         json.dumps(approval, default=str), json.dumps(messages, default=str),
+         json.dumps(investigation, default=str) if investigation else None,
+         datetime.now().isoformat(timespec="seconds"), None, None))
+    conn.commit()
+    conn.close()
+
+
+def get_pending_approval(run_id: str) -> dict | None:
+    """Return the approval record for a run (any status), decoded."""
+    conn = connect()
+    row = conn.execute("SELECT * FROM pending_approvals WHERE run_id = ?",
+                       (run_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    out = dict(row)
+    out["approval"] = json.loads(out.pop("approval_json"))
+    out["messages"] = json.loads(out.pop("messages_json"))
+    raw = out.pop("investigation_json")
+    out["investigation"] = json.loads(raw) if raw else None
+    return out
+
+
+def resolve_pending_approval(run_id: str, po_id: str, approved: bool,
+                             note: str = "") -> bool:
+    """Record the buyer's decision and release (or cancel) the PO.
+
+    Only a PO still awaiting a decision can move, so a repeated or late
+    approval can never place an order twice. Returns False if there was
+    nothing pending to decide.
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    conn = connect()
+    cur = conn.execute(
+        "UPDATE purchase_orders SET status = ? WHERE id = ? "
+        "AND status IN ('pending_approval', 'threshold_unknown')",
+        ("placed" if approved else "rejected", po_id))
+    if cur.rowcount == 0:
+        conn.close()
+        return False
+    conn.execute(
+        "UPDATE pending_approvals SET status = ?, decided_at = ?, "
+        "decision_note = ? WHERE run_id = ?",
+        ("approved" if approved else "rejected", now, note or None, run_id))
+    conn.commit()
+    conn.close()
+    return True
