@@ -316,6 +316,26 @@ def _rehydrate(run_id: str, token: dict | None) -> Run | None:
     return rebuilt
 
 
+def check_resumable(run_id: str, token: dict | None) -> tuple[int, str] | None:
+    """Pre-flight for POST /api/approve. Returns (http_status, message) if the
+    decision cannot be applied, or None if the run is waiting for one."""
+    run = RUNS.get(run_id)
+    if run is not None and run.status == "awaiting_approval":
+        return None
+    if token:
+        db.import_run_state(token)
+    saved = db.get_pending_approval(run_id)
+    if saved is not None:
+        if saved["status"] != "pending":
+            return (409, "{} was already {}. Nothing was changed.".format(
+                saved["po_id"], saved["status"]))
+        return None
+    if token and token.get("messages"):
+        return None
+    return (404, "Run " + run_id + " is not awaiting approval or its state "
+                 "is gone. Start a new run.")
+
+
 async def resume(run_id: str, approved: bool, note: str = "",
                  resume_token: dict | None = None):
     """Resume a parked run once the buyer has decided."""
@@ -351,7 +371,19 @@ async def resume(run_id: str, approved: bool, note: str = "",
     run.status = "running"
     run.pending_po = None
 
+    if not approved:
+        db.save_escalation(run.id, po_id, "approval_rejected",
+                           note or "Buyer rejected the purchase order.")
+
     yield {"type": "status", "status": "running",
            "decision": "approved" if approved else "rejected"}
     async for event in drive(run):
+        # The decision is recorded, but the run did not get to the end of it:
+        # flag it so the buyer is not left assuming the order was validated.
+        if event["type"] == "error" or (
+                event["type"] == "done"
+                and event.get("reason") == "step limit reached"):
+            db.save_escalation(run.id, po_id, "run_stalled",
+                               event.get("message") or event.get("reason"))
+            event = {**event, "escalated": True}
         yield event

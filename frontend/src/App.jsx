@@ -16,7 +16,10 @@ async function streamNdjson(url, body, onEvent) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok || !res.body) throw new Error("Request failed: " + res.status);
+  if (!res.ok || !res.body) {
+    const detail = await res.json().then((j) => j.detail).catch(() => null);
+    throw new Error(detail || "Request failed: " + res.status);
+  }
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();

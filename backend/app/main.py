@@ -12,7 +12,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -66,6 +66,14 @@ async def run(body: RunRequest):
 
 @app.post("/api/approve")
 async def approve(body: ApprovalRequest):
+    """Approve or reject the PO a run is parked on, then stream the resumed run.
+
+    404 if the run is unknown, 409 if its PO has already been decided.
+    """
+    db.ensure_seeded()
+    problem = agent.check_resumable(body.run_id, body.resume_token)
+    if problem:
+        raise HTTPException(status_code=problem[0], detail=problem[1])
     return StreamingResponse(
         ndjson(agent.resume(body.run_id, body.approved, body.note,
                             body.resume_token)),
@@ -87,7 +95,8 @@ def run_state(run_id: str):
     return {"run_id": run_id, "status": status,
             "approval": saved["approval"],
             "decided_at": saved["decided_at"],
-            "decision_note": saved["decision_note"]}
+            "decision_note": saved["decision_note"],
+            "escalations": db.get_escalations(run_id)}
 
 
 @app.get("/api/scenario")

@@ -149,6 +149,17 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     decided_at TEXT,
     decision_note TEXT
 );
+-- Conditions after an approval decision that need a human to look again.
+-- trigger: approval_rejected (buyer denied the PO) or run_stalled (the run
+-- could not finish after the decision).
+CREATE TABLE IF NOT EXISTS escalations (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    po_id TEXT,
+    trigger TEXT NOT NULL,
+    detail TEXT,
+    created_at TEXT NOT NULL
+);
 """
 
 # --- seed ----------------------------------------------------------------
@@ -207,7 +218,7 @@ def reset_and_seed() -> None:
     for table in ("inventory", "suppliers", "contracts", "catalog",
                   "purchase_orders", "confirmations", "quote_results",
                   "ranking_results", "decisions", "approval_gates",
-                  "pending_approvals"):
+                  "pending_approvals", "escalations"):
         conn.execute(f"DELETE FROM {table}")
     conn.executemany("INSERT INTO inventory VALUES (?,?,?,?,?)", INVENTORY)
     conn.executemany("INSERT INTO suppliers VALUES (?,?,?,?)", SUPPLIERS)
@@ -457,3 +468,26 @@ def resolve_pending_approval(run_id: str, po_id: str, approved: bool,
     conn.commit()
     conn.close()
     return True
+
+
+def save_escalation(run_id: str, po_id: str | None, trigger: str,
+                    detail: str | None = None) -> str:
+    """Record a denial or stall so it can be surfaced to the buyer."""
+    esc_id = "ESC-" + uuid.uuid4().hex[:8].upper()
+    conn = connect()
+    conn.execute(
+        "INSERT INTO escalations VALUES (?,?,?,?,?,?)",
+        (esc_id, run_id, po_id, trigger, detail,
+         datetime.now().isoformat(timespec="seconds")))
+    conn.commit()
+    conn.close()
+    return esc_id
+
+
+def get_escalations(run_id: str) -> list[dict]:
+    conn = connect()
+    rows = conn.execute(
+        "SELECT * FROM escalations WHERE run_id = ? ORDER BY created_at",
+        (run_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
