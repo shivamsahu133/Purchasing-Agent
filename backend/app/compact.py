@@ -68,13 +68,28 @@ def _get_supplier_quotes(r: dict) -> dict:
 
 
 def _rank_suppliers(r: dict) -> dict:
-    return {
+    out = {
         "sku": r["sku"], "qty": r["qty"], "need_by": r["need_by"],
         "options": [_option(o) for o in r["ranked_options"]],
         "feasible_count": r["feasible_count"],
         "recommendation": r["recommendation"],
+        "confidence": r["confidence"],
         "rationale": r["rationale"],
     }
+    if r.get("confidence_note"):
+        out["confidence_note"] = r["confidence_note"]
+    if r.get("recommendation_detail"):
+        d = r["recommendation_detail"]
+        out["recommendation_detail"] = {
+            "supplier_id": d["supplier_id"],
+            "supplier_name": d["supplier_name"],
+            "unit_price": d["unit_price"],
+            "total_cost": d["total_cost"],
+            "lead_time_days": d["lead_time_days"],
+            "estimated_delivery": d["estimated_delivery"],
+            "score": d["score"],
+        }
+    return out
 
 
 def _validate_order(r: dict) -> dict:

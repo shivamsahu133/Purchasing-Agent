@@ -88,3 +88,120 @@ def test_explanation_names_the_runner_up():
 def test_explanation_is_honest_when_nothing_is_viable():
     ranked = scoring.score_quotes([quote("A", 4.0, 40, avail=10)], 100, NEED_BY)
     assert "No supplier can meet" in scoring.explain_choice(ranked)
+
+
+# --- AC-3: policy-aware hook ---------------------------------------------
+
+def test_default_policy_has_all_required_weight_keys():
+    assert set(scoring.DEFAULT_POLICY["weights"]) == {"price", "speed", "reliability", "contract"}
+    assert "infeasible_penalty" in scoring.DEFAULT_POLICY
+
+
+def test_no_policy_produces_same_result_as_default_policy():
+    q = [quote("A", 4.0, 5, avail=9999), quote("B", 5.0, 3, avail=9999)]
+    without = scoring.score_quotes(q, 100, NEED_BY)
+    with_default = scoring.score_quotes(q, 100, NEED_BY, policy=scoring.DEFAULT_POLICY)
+    assert [r["supplier_id"] for r in without] == [r["supplier_id"] for r in with_default]
+    assert [r["score"] for r in without] == [r["score"] for r in with_default]
+
+
+def test_custom_policy_weights_change_the_ranking():
+    """A speed-first policy promotes the faster-but-pricier supplier over the
+    cheaper-but-slower one. Proves the policy hook actually affects outcomes."""
+    cheap_slow = quote("CHEAP_SLOW", price=4.0, lead=7, avail=9999)
+    expensive_fast = quote("EXPENSIVE_FAST", price=6.0, lead=2, avail=9999)
+
+    # Default weights: cheaper supplier wins on price
+    default_ranked = scoring.score_quotes([cheap_slow, expensive_fast], 100, NEED_BY)
+    assert default_ranked[0]["supplier_id"] == "CHEAP_SLOW"
+
+    # Speed-first policy: faster supplier wins
+    speed_policy = {"weights": {"price": 0.10, "speed": 0.70,
+                                "reliability": 0.15, "contract": 0.05}}
+    speed_ranked = scoring.score_quotes([cheap_slow, expensive_fast], 100, NEED_BY,
+                                        policy=speed_policy)
+    assert speed_ranked[0]["supplier_id"] == "EXPENSIVE_FAST"
+
+
+def test_custom_infeasible_penalty_is_applied():
+    """A stricter penalty should push infeasible options further down."""
+    feasible = quote("OK", price=5.0, lead=5, avail=9999)
+    infeasible = quote("LATE", price=1.0, lead=30, avail=9999)  # arrives too late
+
+    strict_policy = {"infeasible_penalty": 0.01}
+    ranked = scoring.score_quotes([feasible, infeasible], 100, NEED_BY,
+                                   policy=strict_policy)
+    assert ranked[0]["supplier_id"] == "OK"
+    assert ranked[1]["score"] < ranked[0]["score"] * 0.10
+
+
+def test_effective_weights_recorded_in_each_ranked_entry():
+    custom_weights = {"price": 0.50, "speed": 0.20, "reliability": 0.20, "contract": 0.10}
+    ranked = scoring.score_quotes([quote("A", 4.0, 5, avail=9999)], 100, NEED_BY,
+                                   policy={"weights": custom_weights})
+    assert ranked[0]["weights"] == custom_weights
+
+
+# --- select_recommendation -----------------------------------------------
+
+def test_select_recommendation_picks_the_top_feasible_option():
+    ranked = scoring.score_quotes([
+        quote("CHEAP", 4.0, 5, avail=9999),
+        quote("PRICEY", 9.0, 5, avail=9999, rel=0.5),
+    ], 100, NEED_BY)
+    result = scoring.select_recommendation(ranked)
+    assert result["recommended_supplier_id"] == "CHEAP"
+    assert result["recommended_option"]["supplier_id"] == "CHEAP"
+
+
+def test_select_recommendation_high_confidence_when_clear_winner():
+    ranked = scoring.score_quotes([
+        quote("A", 4.0, 5, avail=9999),
+        quote("B", 9.0, 9, avail=9999, rel=0.5),
+    ], 100, NEED_BY)
+    result = scoring.select_recommendation(ranked)
+    assert result["confidence"] == "high"
+    assert result["confidence_note"] is None
+
+
+def test_select_recommendation_low_confidence_when_only_one_feasible():
+    ranked = scoring.score_quotes([
+        quote("GOOD", 5.0, 5, avail=9999),
+        quote("LATE", 5.0, 40, avail=9999),
+    ], 100, NEED_BY)
+    result = scoring.select_recommendation(ranked)
+    assert result["confidence"] == "low"
+    assert "GOOD" in result["confidence_note"]
+
+
+def test_select_recommendation_low_confidence_on_near_tie():
+    ranked = scoring.score_quotes([
+        quote("A", 5.0, 5, avail=9999, rel=0.9),
+        quote("B", 5.0, 5, avail=9999, rel=0.9),
+    ], 100, NEED_BY)
+    result = scoring.select_recommendation(ranked)
+    assert result["confidence"] == "low"
+    assert result["recommended_supplier_id"] is not None
+
+
+def test_select_recommendation_returns_none_when_no_feasible_options():
+    ranked = scoring.score_quotes([quote("A", 5.0, 40, avail=10)], 100, NEED_BY)
+    result = scoring.select_recommendation(ranked)
+    assert result["recommended_supplier_id"] is None
+    assert result["recommended_option"] is None
+
+
+def test_select_recommendation_returns_none_for_empty_input():
+    result = scoring.select_recommendation([])
+    assert result["recommended_supplier_id"] is None
+
+
+def test_select_recommendation_option_snapshot_has_required_fields():
+    ranked = scoring.score_quotes([
+        quote("A", 4.0, 5, avail=9999),
+        quote("B", 9.0, 9, avail=9999, rel=0.5),
+    ], 100, NEED_BY)
+    opt = scoring.select_recommendation(ranked)["recommended_option"]
+    for field in ("supplier_id", "supplier_name", "unit_price", "total_cost",
+                  "lead_time_days", "estimated_delivery", "score", "score_breakdown"):
+        assert field in opt, f"missing field: {field}"

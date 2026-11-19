@@ -6,13 +6,36 @@ recomputed server-side from the catalog, so a hallucinated figure cannot reach
 a purchase order.
 """
 import asyncio
+import os
 import uuid
 from datetime import date, datetime, timedelta
 
 from . import db, scoring, suppliers
 
-# Orders at or above this value need a human before they are placed.
+# Default approval threshold. Can be overridden by APPROVAL_THRESHOLD_USD env
+# var. Setting the env var to an empty string signals the policy is explicitly
+# unconfigured — the run must escalate rather than guess.
 APPROVAL_THRESHOLD = 10_000.0
+
+
+def get_approval_threshold() -> float | None:
+    """Return the configured approval threshold, or None if unconfigured.
+
+    Reads APPROVAL_THRESHOLD_USD from the environment:
+      - absent  → fall back to the APPROVAL_THRESHOLD constant (10 000)
+      - empty / non-numeric → policy intentionally unset; caller must escalate
+      - valid float → use that value
+    """
+    raw = os.getenv("APPROVAL_THRESHOLD_USD")
+    if raw is None:
+        return APPROVAL_THRESHOLD
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 # Deviation between the PO we send and the confirmation we get back, per
 # supplier. This is the seam the validation stage exists to find.
@@ -86,20 +109,39 @@ async def get_supplier_quotes(sku: str, qty: int) -> dict:
 
 
 async def rank_suppliers(sku: str, qty: int, need_by: str,
-                         budget: float = None) -> dict:
-    """Score every live quote against the requirement. Deterministic."""
+                         budget: float = None, run_id: str = "") -> dict:
+    """Score every live quote, select a recommendation, and persist the decision.
+
+    Uses scoring.DEFAULT_POLICY for weights and thresholds. The ranking is
+    computed entirely in code — the model reads the result and explains it,
+    but never controls a number that affects which supplier wins.
+    """
     quotes = await suppliers.fetch_all_quotes(sku, qty)
     ranked = scoring.score_quotes(quotes, qty, need_by, budget)
-    feasible = [r for r in ranked if r["feasible"]]
+    recommendation = scoring.select_recommendation(ranked)
+    rationale = scoring.explain_choice(ranked)
+
+    decision_id = None
+    if run_id:
+        decision_id = db.save_decision(
+            run_id, sku, qty, need_by, ranked, recommendation, rationale)
+    db.save_ranking_result(run_id, sku, qty, need_by, scoring.DEFAULT_POLICY,
+                           ranked, recommendation["recommended_supplier_id"])
+
     return {
         "sku": sku,
         "qty": qty,
         "need_by": need_by,
+        "policy_applied": scoring.DEFAULT_POLICY,
         "weights_used": scoring.WEIGHTS,
         "ranked_options": ranked,
-        "feasible_count": len(feasible),
-        "recommendation": feasible[0]["supplier_id"] if feasible else None,
-        "rationale": scoring.explain_choice(ranked),
+        "feasible_count": sum(1 for r in ranked if r["feasible"]),
+        "recommendation": recommendation["recommended_supplier_id"],
+        "confidence": recommendation["confidence"],
+        "confidence_note": recommendation.get("confidence_note"),
+        "recommendation_detail": recommendation.get("recommended_option"),
+        "rationale": rationale,
+        "decision_id": decision_id,
     }
 
 
@@ -108,6 +150,7 @@ async def create_purchase_order(sku: str, supplier_id: str, qty: int,
     """Raise a PO. Blocks on human approval at or above the threshold.
 
     The unit price is taken from the catalog, never from the caller.
+    The approval gate decision is always persisted to the approval_gates table.
     """
     conn = db.connect()
     row = conn.execute(
@@ -134,7 +177,33 @@ async def create_purchase_order(sku: str, supplier_id: str, qty: int,
     total = round(unit_price * qty, 2)
     promised = (date.today() + timedelta(days=row["lead_time_days"])).isoformat()
     po_id = "PO-" + uuid.uuid4().hex[:6].upper()
-    needs_approval = total >= APPROVAL_THRESHOLD
+
+    threshold = get_approval_threshold()
+
+    if threshold is None:
+        # AC-3: policy unconfigured — draft without placing and flag for escalation.
+        status = "threshold_unknown"
+        conn.execute(
+            "INSERT INTO purchase_orders VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (po_id, run_id, sku, supplier_id, qty, unit_price, total, need_by,
+             promised, status, datetime.now().isoformat(timespec="seconds")))
+        conn.commit()
+        conn.close()
+        gate_id = db.save_approval_gate(run_id, po_id, total, None, "uncertain")
+        return {
+            "po_id": po_id, "sku": sku, "supplier_id": supplier_id,
+            "supplier_name": name, "qty": qty, "unit_price": unit_price,
+            "total": total, "need_by": need_by, "promised_date": promised,
+            "status": status, "gate_id": gate_id,
+            "approval_required": True,
+            "message": (
+                "Approval threshold is not configured. The order has been "
+                "drafted but NOT placed. Call escalate_to_buyer — do not "
+                "proceed without a policy decision."),
+        }
+
+    needs_approval = total >= threshold
+    outcome = "requires_approval" if needs_approval else "auto_approved"
     status = "pending_approval" if needs_approval else "placed"
 
     conn.execute(
@@ -144,18 +213,21 @@ async def create_purchase_order(sku: str, supplier_id: str, qty: int,
     conn.commit()
     conn.close()
 
+    gate_id = db.save_approval_gate(run_id, po_id, total, threshold, outcome)
+
     result = {
         "po_id": po_id, "sku": sku, "supplier_id": supplier_id,
         "supplier_name": name, "qty": qty, "unit_price": unit_price,
         "total": total, "need_by": need_by, "promised_date": promised,
-        "status": status,
+        "lead_time_days": row["lead_time_days"],
+        "status": status, "gate_id": gate_id,
     }
     if needs_approval:
         result["approval_required"] = True
         result["message"] = (
             "${:,.2f} is at or above the ${:,.0f} approval threshold. "
             "The order is DRAFTED but NOT placed. Stop here and wait for the "
-            "buyer to approve or reject.".format(total, APPROVAL_THRESHOLD))
+            "buyer to approve or reject.".format(total, threshold))
     else:
         result["message"] = "Order placed with the supplier."
     return result
@@ -169,6 +241,10 @@ async def get_order_confirmation(po_id: str) -> dict:
     if po is None:
         conn.close()
         return {"error": "No purchase order " + po_id + "."}
+    if po["status"] == "threshold_unknown":
+        conn.close()
+        return {"error": po_id + " cannot be confirmed — approval threshold is "
+                "unconfigured. Call escalate_to_buyer."}
     if po["status"] == "pending_approval":
         conn.close()
         return {"error": po_id + " has not been placed yet - it is awaiting "
@@ -502,7 +578,8 @@ async def call_tool(name: str, args: dict, run_id: str = "") -> dict:
     fn = DISPATCH.get(name)
     if fn is None:
         return {"error": "Unknown tool " + str(name) + "."}
-    if name in ("create_purchase_order", "investigate_replenishment_need"):
+    if name in ("create_purchase_order", "investigate_replenishment_need",
+                "rank_suppliers"):
         args = dict(args, run_id=run_id)
     try:
         return await fn(**args)
