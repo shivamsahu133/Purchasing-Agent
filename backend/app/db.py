@@ -78,6 +78,21 @@ CREATE TABLE IF NOT EXISTS confirmations (
     promised_date TEXT NOT NULL,
     received_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS quote_results (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    sku TEXT NOT NULL,
+    supplier_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    unit_price REAL,
+    lead_time_days INTEGER,
+    min_order_qty INTEGER,
+    available_qty INTEGER,
+    contracted_price REAL,
+    contracted_lead_time_days INTEGER,
+    conflict_detail TEXT,
+    gathered_at TEXT NOT NULL
+);
 -- Audit trail for every deterministic ranking call.
 CREATE TABLE IF NOT EXISTS ranking_results (
     id TEXT PRIMARY KEY,
@@ -176,8 +191,8 @@ def reset_and_seed() -> None:
     conn = connect()
     conn.executescript(SCHEMA)
     for table in ("inventory", "suppliers", "contracts", "catalog",
-                  "purchase_orders", "confirmations", "ranking_results",
-                  "decisions", "approval_gates"):
+                  "purchase_orders", "confirmations", "quote_results",
+                  "ranking_results", "decisions", "approval_gates"):
         conn.execute(f"DELETE FROM {table}")
     conn.executemany("INSERT INTO inventory VALUES (?,?,?,?,?)", INVENTORY)
     conn.executemany("INSERT INTO suppliers VALUES (?,?,?,?)", SUPPLIERS)
@@ -199,6 +214,36 @@ def ensure_seeded() -> None:
     conn.close()
     if empty:
         reset_and_seed()
+
+
+# --- quote persistence ---------------------------------------------------
+
+def save_quote_results(run_id: str, sku: str, quotes: list,
+                       unavailable_ids: list, conflicts: list) -> None:
+    """Persist gathered quotes and gaps so runs are auditable and resumable."""
+    conflict_by_supplier: dict[str, list[str]] = {}
+    for c in conflicts:
+        conflict_by_supplier.setdefault(c["supplier_id"], []).append(c["detail"])
+
+    now = datetime.now().isoformat(timespec="seconds")
+    conn = connect()
+    for q in quotes:
+        sid = q["supplier_id"]
+        details = conflict_by_supplier.get(sid)
+        conn.execute(
+            "INSERT OR REPLACE INTO quote_results VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("{}|{}|{}".format(run_id or "_", sku, sid), run_id, sku, sid,
+             "received", q["unit_price"], q["lead_time_days"],
+             q["min_order_qty"], q["available_qty"],
+             q.get("contracted_price"), q.get("contracted_lead_time_days"),
+             json.dumps(details) if details else None, now))
+    for sid in unavailable_ids:
+        conn.execute(
+            "INSERT OR REPLACE INTO quote_results VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("{}|{}|{}".format(run_id or "_", sku, sid), run_id, sku, sid,
+             "unavailable", None, None, None, None, None, None, None, now))
+    conn.commit()
+    conn.close()
 
 
 # --- ranking audit -------------------------------------------------------
@@ -229,6 +274,8 @@ def export_run_state(run_id: str) -> dict:
     conn = connect()
     orders = [dict(r) for r in conn.execute(
         "SELECT * FROM purchase_orders WHERE run_id = ?", (run_id,)).fetchall()]
+    quote_results = [dict(r) for r in conn.execute(
+        "SELECT * FROM quote_results WHERE run_id = ?", (run_id,)).fetchall()]
     ids = [o["id"] for o in orders]
     confirmations = []
     if ids:
@@ -242,6 +289,7 @@ def export_run_state(run_id: str) -> dict:
         "SELECT * FROM approval_gates WHERE run_id = ?", (run_id,)).fetchall()]
     conn.close()
     return {"orders": orders, "confirmations": confirmations,
+            "quote_results": quote_results,
             "decisions": decisions, "gates": gates}
 
 
@@ -261,6 +309,14 @@ def import_run_state(state: dict | None) -> None:
         conn.execute("INSERT OR REPLACE INTO confirmations VALUES (?,?,?,?,?)",
                      (c["po_id"], c["confirmed_unit_price"], c["confirmed_qty"],
                       c["promised_date"], c["received_at"]))
+    for q in state.get("quote_results") or []:
+        conn.execute(
+            "INSERT OR REPLACE INTO quote_results VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (q["id"], q["run_id"], q["sku"], q["supplier_id"], q["status"],
+             q["unit_price"], q["lead_time_days"], q["min_order_qty"],
+             q["available_qty"], q["contracted_price"],
+             q["contracted_lead_time_days"], q["conflict_detail"],
+             q["gathered_at"]))
     for d in state.get("decisions") or []:
         conn.execute(
             "INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",

@@ -60,6 +60,7 @@ async def fetch_quote(supplier_id: str, sku: str, qty: int) -> dict | None:
         "reliability": row["reliability"],
         "under_contract": contract is not None,
         "contracted_price": contract["contracted_price"] if contract else None,
+        "contracted_lead_time_days": contract["lead_time_days"] if contract else None,
         "supplier_note": row["notes"],
     }
 
@@ -72,3 +73,22 @@ async def fetch_all_quotes(sku: str, qty: int) -> list[dict]:
 
     results = await asyncio.gather(*(fetch_quote(i, sku, qty) for i in ids))
     return [r for r in results if r is not None]
+
+
+async def fetch_all_quotes_with_gaps(sku: str, qty: int) -> dict:
+    """Like fetch_all_quotes but also reports which suppliers returned nothing.
+
+    Returns {"quotes": [...], "unavailable_supplier_ids": [...]}.
+    """
+    conn = db.connect()
+    ids = [r["id"] for r in conn.execute("SELECT id FROM suppliers").fetchall()]
+    conn.close()
+
+    results = await asyncio.gather(*(fetch_quote(i, sku, qty) for i in ids))
+    quotes, unavailable = [], []
+    for supplier_id, result in zip(ids, results):
+        if result is not None:
+            quotes.append(result)
+        else:
+            unavailable.append(supplier_id)
+    return {"quotes": quotes, "unavailable_supplier_ids": unavailable}
